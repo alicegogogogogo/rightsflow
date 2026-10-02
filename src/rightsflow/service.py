@@ -223,13 +223,16 @@ class RightsFlow:
 
     def evidence(self, request_id: str) -> dict[str, Any]:
         self._load(request_id)
+        entries = self._evidence_entries(request_id)
+        return {"request_id": request_id, "entries": entries, **evidence_module.verify_chain(entries)}
+
+    def _evidence_entries(self, request_id: str) -> list[dict[str, Any]]:
         rows = self.store.connection.execute(
             "SELECT content, previous_hash, hash FROM evidence WHERE request_id = ? ORDER BY sequence",
             (request_id,),
         ).fetchall()
-        entries = [{"content": self.store.decode(row["content"]), "previous_hash": row["previous_hash"],
-                    "hash": row["hash"]} for row in rows]
-        return {"request_id": request_id, "entries": entries, **evidence_module.verify_chain(entries)}
+        return [{"content": self.store.decode(row["content"]), "previous_hash": row["previous_hash"],
+                 "hash": row["hash"]} for row in rows]
 
     def verify_evidence(self, raw: Any) -> dict[str, Any]:
         return evidence_module.verify_chain(evidence_module.parse_entries(raw))
@@ -314,6 +317,59 @@ class RightsFlow:
         records = [{"request_id": row["request_id"], "record_id": row["record_id"],
                     **_record_view(row, self.store)} for row in rows]
         return {"subject_id": subject_id, "count": len(records), "records": records}
+
+    # --------------------------------------------------------------- audit export
+
+    def audit_export(self, request_id: str | None, include_records: bool) -> dict[str, Any]:
+        """Read-only audit snapshot of requests, their evidence chains, and records.
+
+        Nothing here writes to the store; `generated_at` reads the injected clock
+        and is deliberately excluded from the digest so the digest is reproducible.
+        """
+        if request_id is not None:
+            self._load(request_id)
+            request_rows = self.store.connection.execute(
+                "SELECT id, document, head_hash FROM requests WHERE id = ?", (request_id,)).fetchall()
+        else:
+            request_rows = self.store.connection.execute(
+                "SELECT id, document, head_hash FROM requests ORDER BY id").fetchall()
+        requests: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = []
+        for row in request_rows:
+            document = self.store.decode(row["document"])
+            entries = self._evidence_entries(document["id"])
+            evidence.extend(entries)
+            requests.append({
+                "id": document["id"], "subject_id": document["subject_id"],
+                "state": document["state"],
+                "received_at": document["received_at"], "updated_at": document["updated_at"],
+                "evidence_head": row["head_hash"],
+                "first_invalid_sequence": evidence_module.verify_chain(entries)["first_invalid_sequence"],
+            })
+        if request_id is not None:
+            record_rows = self.store.connection.execute(
+                "SELECT request_id, record_id, subject_id, payload, anonymized FROM records"
+                " WHERE request_id = ? ORDER BY request_id, record_id", (request_id,)).fetchall()
+        else:
+            record_rows = self.store.connection.execute(
+                "SELECT request_id, record_id, subject_id, payload, anonymized FROM records"
+                " ORDER BY request_id, record_id").fetchall()
+        records = []
+        for row in record_rows:
+            record = {"request_id": row["request_id"], "record_id": row["record_id"],
+                      "subject_id": row["subject_id"], "anonymized": bool(row["anonymized"])}
+            if include_records:
+                record["payload"] = self.store.decode(row["payload"])
+            records.append(record)
+        digest = evidence_module.sha256_hex(evidence_module.canonical_json(
+            {"filter": request_id, "requests": requests, "evidence": evidence, "records": records}))
+        return {
+            "generated_at": format_timestamp(self._now()),
+            "filter": request_id,
+            "requests": requests, "evidence": evidence, "records": records,
+            "totals": {"requests": len(requests), "evidence": len(evidence), "records": len(records)},
+            "export_digest": digest,
+        }
 
     # ----------------------------------------------------------- retrieval tasks
 

@@ -42,6 +42,20 @@ class Handler(BaseHTTPRequestHandler):
             raise ValidationError(f"unknown query parameter(s): {', '.join(sorted(set(query) - {'at'}))}")
         return query["at"][0] if "at" in query else None
 
+    def _query_export(self, query: dict[str, list[str]]) -> tuple[str | None, bool]:
+        allowed = {"request_id", "include_records"}
+        unknown = sorted(set(query) - allowed)
+        if unknown:
+            raise ValidationError(f"unknown query parameter(s): {', '.join(unknown)}", "unknown_query")
+        duplicates = sorted(name for name in query if len(query[name]) > 1)
+        if duplicates:
+            raise ValidationError(f"duplicate query parameter(s): {', '.join(duplicates)}", "duplicate_query")
+        include_records = query.get("include_records", ["false"])[0]
+        if include_records not in ("true", "false"):
+            raise ValidationError("include_records must be true or false", "invalid_include_records")
+        request_id = query["request_id"][0] if "request_id" in query else None
+        return request_id, include_records == "true"
+
     def _dispatch(self) -> tuple[int, Any]:
         split = urlsplit(self.path)
         parts = tuple(part for part in split.path.split("/") if part)
@@ -50,6 +64,9 @@ class Handler(BaseHTTPRequestHandler):
         command, service = self.command, self.service
         if command == "GET" and parts == ("health",):
             return 200, {"status": "ok"}
+        if command == "GET" and parts == ("audit", "export"):
+            request_id, include_records = self._query_export(parse_qs(split.query, keep_blank_values=True))
+            return 200, service.audit_export(request_id, include_records)
         if command == "POST" and parts == ("policies",):
             return 201, service.create_policy(self._body(), key)
         if command == "POST" and parts == ("requests",):
@@ -92,7 +109,10 @@ class Handler(BaseHTTPRequestHandler):
             status, response = self._dispatch()
             self._json(status, response)
         except RightsFlowError as error:
-            self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            body = {"code": error.code, "message": str(error)}
+            if getattr(error, "error_code", None):
+                body["error_code"] = error.error_code
+            self._json(error.status, {"error": body})
         except Exception:
             self._json(500, {"error": {"code": "internal_error", "message": "internal server error"}})
 
