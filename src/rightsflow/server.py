@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+import argparse
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+from .clock import FixedClock
+from .errors import NotFoundError, RightsFlowError, ValidationError
+from .service import RightsFlow
+
+
+class Handler(BaseHTTPRequestHandler):
+    service: RightsFlow
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def _json(self, status: int, value: Any) -> None:
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> Any:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.split(";", 1)[0].strip().lower() != "application/json":
+            raise ValidationError("Content-Type must be application/json")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or length > 1_000_000:
+                raise ValueError
+            return json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError) as error:
+            raise ValidationError("request body must be valid JSON") from error
+
+    def _query_at(self, query: dict[str, list[str]]) -> str | None:
+        if set(query) - {"at"}:
+            raise ValidationError(f"unknown query parameter(s): {', '.join(sorted(set(query) - {'at'}))}")
+        return query["at"][0] if "at" in query else None
+
+    def _dispatch(self) -> tuple[int, Any]:
+        split = urlsplit(self.path)
+        parts = tuple(part for part in split.path.split("/") if part)
+        query = parse_qs(split.query)
+        key = self.headers.get("Idempotency-Key")
+        command, service = self.command, self.service
+        if command == "GET" and parts == ("health",):
+            return 200, {"status": "ok"}
+        if command == "POST" and parts == ("policies",):
+            return 201, service.create_policy(self._body(), key)
+        if command == "POST" and parts == ("requests",):
+            return 201, service.create_request(self._body(), key)
+        if command == "POST" and parts == ("evidence", "verify"):
+            return 200, service.verify_evidence(self._body())
+        if command == "GET" and len(parts) == 2 and parts[0] == "requests":
+            return 200, service.get_request(parts[1])
+        if len(parts) != 3:
+            raise NotFoundError("route was not found")
+        route = (command, parts[0], parts[2])
+        if route == ("GET", "requests", "evidence"):
+            return 200, service.evidence(parts[1])
+        if route == ("POST", "requests", "transitions"):
+            return 200, service.transition(parts[1], self._body(), key)
+        if route == ("GET", "policy", "due"):
+            return 200, service.policy_due(parts[1], self._query_at(query))
+        if route == ("POST", "policies", "enforce"):
+            return 200, service.enforce_policy(parts[1], self._body(), key)
+        if route == ("GET", "subjects", "records"):
+            return 200, service.subject_records(parts[1])
+        raise NotFoundError("route was not found")
+
+    def _handle(self) -> None:
+        try:
+            status, response = self._dispatch()
+            self._json(status, response)
+        except RightsFlowError as error:
+            self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+        except Exception:
+            self._json(500, {"error": {"code": "internal_error", "message": "internal server error"}})
+
+    do_GET = _handle
+    do_POST = _handle
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the RightsFlow HTTP service")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=8080, type=int)
+    parser.add_argument("--database", default="rightsflow.db")
+    parser.add_argument("--now", default=None, help="freeze the injected clock at this ISO 8601 instant")
+    arguments = parser.parse_args()
+    clock = FixedClock(arguments.now) if arguments.now else None
+    Handler.service = RightsFlow(arguments.database, clock=clock)
+    server = ThreadingHTTPServer((arguments.host, arguments.port), Handler)
+    print(f"RightsFlow listening on http://{arguments.host}:{arguments.port}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
