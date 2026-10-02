@@ -234,6 +234,81 @@ class RightsFlow:
     def verify_evidence(self, raw: Any) -> dict[str, Any]:
         return evidence_module.verify_chain(evidence_module.parse_entries(raw))
 
+    # ------------------------------------------------------------- audit export
+
+    def audit_export(self, request_id: str | None = None, include_records: bool = False) -> dict[str, Any]:
+        """Read-only snapshot of requests, evidence integrity, and records.
+
+        Nothing is written: the export is computed and returned, and the only
+        clock read stamps `generated_at`. A named request must exist (`404`);
+        without one the export simply covers every request, including none.
+        """
+        if request_id is not None:
+            self._load(request_id)
+            request_scope, evidence_scope, record_scope = (
+                " WHERE id = ?", " WHERE request_id = ?", " WHERE request_id = ?")
+            parameters: tuple[Any, ...] = (request_id,)
+        else:
+            request_scope = evidence_scope = record_scope = ""
+            parameters = ()
+
+        request_rows = self.store.connection.execute(
+            f"SELECT id, document, head_hash FROM requests{request_scope} ORDER BY id", parameters
+        ).fetchall()
+        requests_view: list[dict[str, Any]] = []
+        evidence_view: list[dict[str, Any]] = []
+        entries_by_request: dict[str, list[dict[str, Any]]] = {}
+        for row in request_rows:
+            document = self.store.decode(row["document"])
+            requests_view.append({
+                "id": document["id"], "subject_id": document["subject_id"], "state": document["state"],
+                "received_at": document["received_at"], "updated_at": document["updated_at"],
+                "evidence_head": row["head_hash"], "first_invalid_sequence": None,
+            })
+            entries_by_request[document["id"]] = []
+
+        evidence_rows = self.store.connection.execute(
+            f"SELECT request_id, content, previous_hash, hash FROM evidence{evidence_scope}"
+            " ORDER BY request_id, sequence", parameters
+        ).fetchall()
+        for row in evidence_rows:
+            entry = {"content": self.store.decode(row["content"]),
+                     "previous_hash": row["previous_hash"], "hash": row["hash"]}
+            evidence_view.append(entry)
+            entries_by_request[row["request_id"]].append(entry)
+
+        for request in requests_view:
+            request["first_invalid_sequence"] = evidence_module.verify_chain(
+                entries_by_request[request["id"]]
+            )["first_invalid_sequence"]
+
+        record_rows = self.store.connection.execute(
+            f"SELECT request_id, record_id, subject_id, payload, anonymized FROM records{record_scope}"
+            " ORDER BY request_id, record_id", parameters
+        ).fetchall()
+        records_view: list[dict[str, Any]] = []
+        for row in record_rows:
+            record = {"request_id": row["request_id"], "record_id": row["record_id"],
+                      "subject_id": row["subject_id"], "anonymized": bool(row["anonymized"])}
+            if include_records:
+                record["payload"] = self.store.decode(row["payload"])
+            records_view.append(record)
+
+        filter_view = {"request_id": request_id} if request_id is not None else None
+        digest_payload = {"filter": filter_view, "requests": requests_view,
+                          "evidence": evidence_view, "records": records_view}
+        return {
+            "generated_at": format_timestamp(self._now()),
+            "filter": filter_view,
+            "requests": requests_view,
+            "evidence": evidence_view,
+            "records": records_view,
+            "totals": {"requests": len(requests_view),
+                       "evidence": len(evidence_view),
+                       "records": len(records_view)},
+            "export_digest": evidence_module.sha256_hex(evidence_module.canonical_json(digest_payload)),
+        }
+
     # ------------------------------------------------------------------ retention
 
     def policy_due(self, policy_id: str, at: str | None = None) -> dict[str, Any]:

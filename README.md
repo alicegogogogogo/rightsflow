@@ -304,6 +304,48 @@ idempotency key. Re-sending the single entry printed under *Evidence chain* abov
 answers `chain_valid: true, count: 1`; changing any byte of its `content` answers
 `first_invalid_sequence: 1, reason: "hash mismatch"`; an empty array reports `count: 0`.
 
+## Audit export
+
+`GET /audit/export` is a **read-only** summary of every request, the evidence
+chains, and the records still held by the store. It writes nothing, never
+touches the disk, and changes no public behavior; `generated_at` is the injected
+clock's current UTC instant. The optional query parameters are `request_id`
+(default: all requests) and `include_records` (default: `false`; only the literal
+strings `true` and `false` are accepted). An unknown parameter, a repeated
+parameter, or an illegal `include_records` is `400 validation_error` with an
+`error_code` of `unknown_query`, `duplicate_query`, or `invalid_include_records`,
+checked in that order. A named `request_id` that does not exist is `404
+not_found` with message `request {id} was not found`; an empty store (or no
+match) is `200` with empty arrays.
+
+```json
+{"generated_at":"2026-01-01T00:00:00Z","filter":null,
+ "requests":[{"id":"req-1","subject_id":"user-42","state":"received","received_at":"2026-01-01T00:00:00Z",
+   "updated_at":"2026-01-01T00:00:00Z","evidence_head":"f8e5…b7f4","first_invalid_sequence":null}],
+ "evidence":[{"content":{...},"previous_hash":null,"hash":"f8e5…b7f4"}],
+ "records":[{"request_id":"req-1","record_id":"r-1","subject_id":"user-42","anonymized":false}],
+ "totals":{"requests":1,"evidence":1,"records":1},
+ "export_digest":"…"}
+```
+
+`requests` are sorted by `id`; `evidence` by `request_id` then `sequence`;
+`records` by `request_id` then `record_id`. Each request carries its stored
+`evidence_head` and the `first_invalid_sequence` of its stored chain, verified in
+the same order as `POST /evidence/verify` (so `null` means the chain is intact).
+A record always carries `request_id`, `record_id`, `subject_id`, and
+`anonymized`; `payload` is present only when `include_records=true`.
+`filter` is `{"request_id": "..."}` when that parameter was supplied and `null`
+otherwise. `export_digest` is
+
+```
+sha256(canonical_json({"filter":…,"requests":…,"evidence":…,"records":…}))
+```
+
+over the UTF-8 bytes: keys sorted recursively, arrays in their returned order,
+and deliberately **without** `generated_at`, so the digest pins the snapshot but
+not the moment it was taken.
+
+
 `GET /policy/{id}/due?at=2026-01-31T00:00:00Z` — `at` is optional and defaults to
 the injected clock; the response carries `policy_id`, `retention_days`, `action`,
 `at`, and `due`, sorted by `request_id`:

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import threading
@@ -136,6 +137,84 @@ class ServerTests(unittest.TestCase):
         status, body = self.call("GET", "/policy/eu/due?when=2026-02-01T00:00:00Z")
         self.assertEqual((400, "unknown query parameter(s): when"), (status, body["error"]["message"]))
         self.assertEqual("2026-02-01T00:00:00Z", self.call("GET", "/policy/eu/due?at=2026-02-01T00:00:00Z")[1]["at"])
+
+    def seed_for_audit(self):
+        self.call("POST", "/policies", {"id": "eu", "retention_days": 30, "action": "delete"}, key="p1")
+        self.call("POST", "/requests", {"id": "req-1", "subject_id": "user-1", "request_type": "access",
+                                        "policy_id": "eu", "sla_days": 30, "actor": "agent"}, key="r1")
+        self.call("POST", "/requests/req-1/transitions",
+                  {"action": "verify_identity", "actor": "dpo"}, key="t1")
+
+    def test_audit_export_empty_store_and_full_snapshot_over_http(self):
+        status, empty = self.call("GET", "/audit/export")
+        self.assertEqual(200, status)
+        self.assertEqual(("2026-01-01T00:00:00Z", None, [], [], []),
+                         (empty["generated_at"], empty["filter"], empty["requests"],
+                          empty["evidence"], empty["records"]))
+        self.assertEqual({"requests": 0, "evidence": 0, "records": 0}, empty["totals"])
+        self.seed_for_audit()
+        status, export = self.call("GET", "/audit/export")
+        self.assertEqual((200, None), (status, export["filter"]))
+        self.assertEqual(1, export["totals"]["requests"])
+        self.assertEqual(2, export["totals"]["evidence"])
+        self.assertEqual(0, export["totals"]["records"])
+        self.assertNotIn("payload", json.dumps(export["records"]))
+        request = export["requests"][0]
+        self.assertEqual({"id", "subject_id", "state", "received_at", "updated_at",
+                          "evidence_head", "first_invalid_sequence"}, set(request))
+        self.assertEqual("identity_verified", request["state"])
+        self.assertIsNone(request["first_invalid_sequence"])
+        self.assertEqual(request["evidence_head"], export["evidence"][-1]["hash"])
+        self.assertEqual({"content", "previous_hash", "hash"}, set(export["evidence"][0]))
+
+    def test_audit_export_filter_and_include_records_over_http(self):
+        self.seed_for_audit()
+        status, filtered = self.call("GET", "/audit/export?request_id=req-1")
+        self.assertEqual((200, {"request_id": "req-1"}, 1),
+                         (status, filtered["filter"], filtered["totals"]["requests"]))
+        status, body = self.call("GET", "/audit/export?request_id=ghost")
+        self.assertEqual((404, "not_found", "request ghost was not found"),
+                         (status, body["error"]["code"], body["error"]["message"]))
+        status, with_payload = self.call("GET", "/audit/export?include_records=true")
+        self.assertEqual(200, status)
+        self.assertEqual(0, with_payload["totals"]["records"])
+        self.call("POST", "/requests/req-1/transitions",
+                  {"action": "scope", "actor": "dpo"}, key="t2")
+        self.call("POST", "/requests/req-1/transitions",
+                  {"action": "collect", "actor": "system",
+                   "details": {"records": [{"id": "rec-1", "payload": {"email": "a@b.test"}}]}}, key="t3")
+        status, with_payload = self.call("GET", "/audit/export?include_records=true&request_id=req-1")
+        self.assertEqual(200, status)
+        self.assertEqual({"email": "a@b.test"}, with_payload["records"][0]["payload"])
+        self.assertEqual(("req-1", "rec-1", "user-1", False),
+                         (with_payload["records"][0]["request_id"], with_payload["records"][0]["record_id"],
+                          with_payload["records"][0]["subject_id"], with_payload["records"][0]["anonymized"]))
+        status, without = self.call("GET", "/audit/export?include_records=false")
+        self.assertEqual(200, status)
+        self.assertNotIn("payload", without["records"][0])
+        self.assertNotEqual(with_payload["export_digest"], without["export_digest"])
+        digest_input = {key: with_payload[key] for key in ("filter", "requests", "evidence", "records")}
+        canonical = json.dumps(digest_input, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        self.assertEqual(hashlib.sha256(canonical.encode()).hexdigest(), with_payload["export_digest"])
+
+    def test_audit_export_query_validation_error_codes(self):
+        cases = [
+            ("/audit/export?bogus=1", "unknown_query"),
+            ("/audit/export?request_id=req-1&bogus=1", "unknown_query"),
+            ("/audit/export?request_id=req-1&request_id=req-2", "duplicate_query"),
+            ("/audit/export?include_records=yes", "invalid_include_records"),
+            ("/audit/export?include_records=", "invalid_include_records"),
+            ("/audit/export?include_records=true&include_records=false", "duplicate_query"),
+        ]
+        for path, error_code in cases:
+            status, body = self.call("GET", path)
+            self.assertEqual((400, "validation_error", error_code),
+                             (status, body["error"]["code"], body["error"].get("error_code")), path)
+        # unknown parameters outrank duplicates, duplicates outrank invalid values
+        status, body = self.call("GET", "/audit/export?bogus=1&request_id=req-1&request_id=req-2")
+        self.assertEqual("unknown_query", body["error"]["error_code"])
+        status, body = self.call("GET", "/audit/export?include_records=bad&include_records=worse")
+        self.assertEqual("duplicate_query", body["error"]["error_code"])
 
 
 if __name__ == "__main__":

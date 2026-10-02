@@ -654,5 +654,149 @@ class SlaAlertTests(unittest.TestCase):
             self.service.acknowledge_sla_alert(created["alert_id"], {"actor": "dpo", "note": "n"}, None)
 
 
+class AuditExportTests(unittest.TestCase):
+    def service(self, moment="2026-01-01T00:00:00Z"):
+        directory = tempfile.TemporaryDirectory()
+        clock = FixedClock(moment)
+        service = RightsFlow(str(Path(directory.name) / "audit.db"), clock=clock)
+        service.create_policy({"id": "eu", "retention_days": 30, "action": "delete"}, "policy-eu")
+        service.create_policy({"id": "anon", "retention_days": 0, "action": "anonymize"}, "policy-anon")
+        return directory, clock, service
+
+    def fulfill(self, service, request_id, subject_id, policy_id="eu", records=None):
+        service.create_request({"id": request_id, "subject_id": subject_id, "request_type": "access",
+                                "policy_id": policy_id, "sla_days": 30, "actor": "agent-7"},
+                               f"create-{request_id}")
+        service.transition(request_id, {"action": "verify_identity", "actor": "dpo"}, f"{request_id}-v")
+        service.transition(request_id, {"action": "scope", "actor": "dpo"}, f"{request_id}-s")
+        service.transition(request_id, {"action": "collect", "actor": "dpo",
+                                        "details": {"records": records or []}}, f"{request_id}-c")
+        service.transition(request_id, {"action": "package", "actor": "dpo",
+                                        "details": {"artifact": "bundle"}}, f"{request_id}-p")
+        return service.transition(request_id, {"action": "fulfill", "actor": "dpo"}, f"{request_id}-f")
+
+    def test_empty_store_is_a_200_empty_snapshot(self):
+        directory, clock, service = self.service()
+        self.addCleanup(directory.cleanup)
+        export = service.audit_export()
+        self.assertEqual("2026-01-01T00:00:00Z", export["generated_at"])
+        self.assertEqual(None, export["filter"])
+        self.assertEqual(([], [], []), (export["requests"], export["evidence"], export["records"]))
+        self.assertEqual({"requests": 0, "evidence": 0, "records": 0}, export["totals"])
+        empty_digest = hashlib.sha256(canonical(
+            {"filter": None, "requests": [], "evidence": [], "records": []}).encode("utf-8")).hexdigest()
+        self.assertEqual(empty_digest, export["export_digest"])
+
+    def test_export_shape_sorting_totals_and_independent_digest(self):
+        directory, clock, service = self.service()
+        self.addCleanup(directory.cleanup)
+        self.fulfill(service, "req-b", "user-2",
+                     records=[{"id": "r-9", "payload": {"phone": "555"}}])
+        self.fulfill(service, "req-a", "user-42",
+                     records=[{"id": "r-1", "payload": {"email": "a@b.test"}},
+                              {"id": "r-2", "payload": {"phone": "111"}}])
+        export = service.audit_export()
+        self.assertEqual({"generated_at", "filter", "requests", "evidence", "records",
+                          "totals", "export_digest"}, set(export))
+        self.assertEqual(None, export["filter"])
+        self.assertEqual(["req-a", "req-b"], [request["id"] for request in export["requests"]])
+        request = export["requests"][0]
+        self.assertEqual(
+            {"id", "subject_id", "state", "received_at", "updated_at",
+             "evidence_head", "first_invalid_sequence"}, set(request))
+        self.assertEqual(("user-42", "fulfilled", None),
+                         (request["subject_id"], request["state"], request["first_invalid_sequence"]))
+        self.assertEqual(request["evidence_head"], service.get_request("req-a")["evidence_head"])
+        evidence_keys = [(entry["content"]["request_id"], entry["content"]["sequence"])
+                         for entry in export["evidence"]]
+        self.assertEqual(evidence_keys, sorted(evidence_keys))
+        self.assertEqual(
+            [("req-a", "r-1"), ("req-a", "r-2"), ("req-b", "r-9")],
+            [(record["request_id"], record["record_id"]) for record in export["records"]])
+        self.assertEqual({"requests": 2, "evidence": 12, "records": 3}, export["totals"])
+        for entry in export["evidence"]:
+            self.assertEqual({"content", "previous_hash", "hash"}, set(entry))
+        for record in export["records"]:
+            self.assertEqual({"request_id", "record_id", "subject_id", "anonymized"}, set(record))
+            self.assertNotIn("payload", record)
+        digest_input = {"filter": export["filter"], "requests": export["requests"],
+                        "evidence": export["evidence"], "records": export["records"]}
+        self.assertEqual(hashlib.sha256(canonical(digest_input).encode("utf-8")).hexdigest(),
+                         export["export_digest"])
+
+    def test_filter_narrows_the_snapshot_and_missing_request_is_not_found(self):
+        directory, clock, service = self.service()
+        self.addCleanup(directory.cleanup)
+        self.fulfill(service, "req-a", "user-42")
+        self.fulfill(service, "req-b", "user-2")
+        export = service.audit_export(request_id="req-b")
+        self.assertEqual({"request_id": "req-b"}, export["filter"])
+        self.assertEqual(["req-b"], [request["id"] for request in export["requests"]])
+        self.assertTrue(all(entry["content"]["request_id"] == "req-b" for entry in export["evidence"]))
+        self.assertEqual((1, 6, 0),
+                         (export["totals"]["requests"], export["totals"]["evidence"], export["totals"]["records"]))
+        digest_input = {"filter": {"request_id": "req-b"}, "requests": export["requests"],
+                        "evidence": export["evidence"], "records": export["records"]}
+        self.assertEqual(hashlib.sha256(canonical(digest_input).encode("utf-8")).hexdigest(),
+                         export["export_digest"])
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            service.audit_export(request_id="ghost")
+
+    def test_include_records_adds_payload_and_changes_the_digest(self):
+        directory, clock, service = self.service()
+        self.addCleanup(directory.cleanup)
+        self.fulfill(service, "req-a", "user-42",
+                     records=[{"id": "r-1", "payload": {"email": "a@b.test"}}])
+        without = service.audit_export()
+        with_payload = service.audit_export(include_records=True)
+        self.assertNotIn("payload", without["records"][0])
+        self.assertEqual({"email": "a@b.test"}, with_payload["records"][0]["payload"])
+        self.assertNotEqual(without["export_digest"], with_payload["export_digest"])
+
+    def test_first_invalid_sequence_follows_the_verify_order(self):
+        directory, clock, service = self.service()
+        self.addCleanup(directory.cleanup)
+        self.fulfill(service, "req-a", "user-42")
+        connection = service.store.connection
+        row = connection.execute(
+            "SELECT content FROM evidence WHERE request_id = ? AND sequence = 3", ("req-a",)).fetchone()
+        content = json.loads(row["content"])
+        content["payload"]["actor"] = "attacker"
+        connection.execute("UPDATE evidence SET content = ? WHERE request_id = ? AND sequence = 3",
+                           (json.dumps(content, separators=(",", ":"), sort_keys=True), "req-a"))
+        export = service.audit_export(request_id="req-a")
+        self.assertEqual(3, export["requests"][0]["first_invalid_sequence"])
+
+    def test_generated_at_reads_only_the_injected_clock_and_export_writes_nothing(self):
+        directory, clock, service = self.service()
+        self.addCleanup(directory.cleanup)
+        self.fulfill(service, "req-a", "user-42")
+        clock.advance(days=7)
+        self.assertEqual("2026-01-08T00:00:00Z", service.audit_export()["generated_at"])
+
+        def table_counts():
+            return {table: service.store.connection.execute(
+                f"SELECT COUNT(*) AS total FROM {table}").fetchone()["total"]
+                for table in ("requests", "evidence", "records", "policies", "idempotency")}
+
+        before = table_counts()
+        first = service.audit_export(include_records=True)
+        second = service.audit_export(include_records=True)
+        self.assertEqual(first, second)
+        self.assertEqual(before, table_counts())
+
+    def test_anonymized_records_keep_rows_under_their_pseudonym(self):
+        directory, clock, service = self.service()
+        self.addCleanup(directory.cleanup)
+        self.fulfill(service, "req-a", "user-42", policy_id="anon",
+                     records=[{"id": "r-1", "payload": {"email": "a@b.test"}}])
+        service.enforce_policy("anon", {"at": "2026-01-01T00:00:00Z"}, "enforce-anon")
+        export = service.audit_export(include_records=True)
+        record = export["records"][0]
+        self.assertTrue(record["anonymized"])
+        self.assertEqual("anon:" + hashlib.sha256(b"user-42:req-a").hexdigest()[:16],
+                         record["subject_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

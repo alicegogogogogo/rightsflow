@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .clock import FixedClock
-from .errors import NotFoundError, RightsFlowError, ValidationError
+from .errors import CodedValidationError, NotFoundError, RightsFlowError, ValidationError
 from .service import RightsFlow
 
 
@@ -42,6 +42,28 @@ class Handler(BaseHTTPRequestHandler):
             raise ValidationError(f"unknown query parameter(s): {', '.join(sorted(set(query) - {'at'}))}")
         return query["at"][0] if "at" in query else None
 
+    def _query_audit(
+        self, query: dict[str, list[str]]
+    ) -> tuple[str | None, bool]:
+        unknown = sorted(set(query) - {"request_id", "include_records"})
+        if unknown:
+            raise CodedValidationError(
+                "unknown_query", f"unknown query parameter(s): {', '.join(unknown)}")
+        repeated = sorted(name for name, values in query.items() if len(values) > 1)
+        if repeated:
+            raise CodedValidationError(
+                "duplicate_query", f"query parameter {repeated[0]} was repeated")
+        request_id = query["request_id"][0] if "request_id" in query else None
+        if "include_records" in query:
+            value = query["include_records"][0]
+            if value not in ("true", "false"):
+                raise CodedValidationError(
+                    "invalid_include_records", "include_records must be true or false")
+            include_records = value == "true"
+        else:
+            include_records = False
+        return request_id, include_records
+
     def _dispatch(self) -> tuple[int, Any]:
         split = urlsplit(self.path)
         parts = tuple(part for part in split.path.split("/") if part)
@@ -56,6 +78,10 @@ class Handler(BaseHTTPRequestHandler):
             return 201, service.create_request(self._body(), key)
         if command == "POST" and parts == ("evidence", "verify"):
             return 200, service.verify_evidence(self._body())
+        if command == "GET" and parts == ("audit", "export"):
+            # Blank values must survive so that `include_records=` is an illegal value.
+            request_id, include_records = self._query_audit(parse_qs(split.query, keep_blank_values=True))
+            return 200, service.audit_export(request_id, include_records)
         if command == "GET" and len(parts) == 2 and parts[0] == "requests":
             return 200, service.get_request(parts[1])
         if len(parts) == 3 and parts[0] == "requests" and parts[2] == "retrieval-tasks":
@@ -92,7 +118,11 @@ class Handler(BaseHTTPRequestHandler):
             status, response = self._dispatch()
             self._json(status, response)
         except RightsFlowError as error:
-            self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            payload = {"error": {"code": error.code, "message": str(error)}}
+            error_code = getattr(error, "error_code", None)
+            if error_code is not None:
+                payload["error"]["error_code"] = error_code
+            self._json(error.status, payload)
         except Exception:
             self._json(500, {"error": {"code": "internal_error", "message": "internal server error"}})
 

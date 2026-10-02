@@ -8,6 +8,14 @@ class ValidationError(RightsFlowError):
     status = 400
 
 
+class CodedValidationError(ValidationError):
+    """A 400 validation_error carrying a machine-readable detail code."""
+
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class NotFoundError(RightsFlowError):
     code = "not_found"
     status = 404
