@@ -242,6 +242,43 @@ other field is `null`, plus aggregate `totals`:
 `completed = succeeded + failed`; `progress_percent` is the completed share
 rounded down — `100` once every task is terminal, `0` when there are no tasks.
 
+## SLA alerts
+
+An **SLA alert** records the fact that an open request has passed its
+`sla_due_at`. Alerts live in their own store: raising or acknowledging one
+changes no request state, writes no evidence entry, and triggers no retention.
+
+`POST /requests/{id}/sla-alerts` *(key required)* — the body must contain
+exactly `{"actor","reason"}`, non-empty strings of at most 200 and 1000
+characters. The request must exist (`404 not_found`), must not be in a terminal
+state (`fulfilled`/`rejected`/`cancelled` → `409 conflict`), and the injected
+clock's current instant must be **strictly** after `sla_due_at` — a measurement
+exactly at `due_at` is not overdue and answers `409 conflict`. Answer `201`:
+
+```json
+{"alert_id":"sla-…","request_id":"req-1","subject_id":"user-42","actor":"monitor-1","reason":"past contractual deadline",
+ "due_at":"2026-01-31T00:00:00Z","detected_at":"2026-02-01T01:00:00Z","overdue_seconds":90000,"status":"open",
+ "acknowledged_at":null,"acknowledged_by":null,"acknowledged_note":null}
+```
+
+`alert_id` is globally unique, `detected_at` is the measured instant, and
+`overdue_seconds` is the whole-second difference `detected_at - due_at`. A
+request keeps at most one alert per `due_at`: a repeat with a new key is
+`409 conflict`, while the same `Idempotency-Key` replays the first response.
+
+`GET /requests/{id}/sla-alerts` — the alerts sorted by `detected_at` then
+`alert_id`, plus `totals` with `total`, `open`, `acknowledged`, and `count`
+(always equal to `total`); an empty result is `[]` with all-zero totals, and a
+missing request is `404 not_found`.
+
+`POST /sla-alerts/{alert_id}/acknowledge` *(key required)* — the body must
+contain exactly `{"actor","note"}` (non-empty, at most 200 and 2000 characters).
+Answer `200` with the alert now in `status: "acknowledged"` and
+`acknowledged_at` (injected clock), `acknowledged_by`, and `acknowledged_note`
+recorded; `due_at`, `detected_at`, and `overdue_seconds` never change. A
+missing alert is `404 not_found`; acknowledging an already-acknowledged alert
+with a new key is `409 conflict`.
+
 `GET /requests/{id}` — the materialized request:
 
 ```json

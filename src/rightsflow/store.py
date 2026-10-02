@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS retrieval_tasks (
   started_at TEXT, finished_at TEXT,
   PRIMARY KEY (request_id, task_id)
 );
+CREATE TABLE IF NOT EXISTS sla_alerts (
+  alert_id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES requests(id), subject_id TEXT NOT NULL,
+  actor TEXT NOT NULL, reason TEXT NOT NULL,
+  due_at TEXT NOT NULL, detected_at TEXT NOT NULL, overdue_seconds INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  acknowledged_at TEXT, acknowledged_by TEXT, acknowledged_note TEXT,
+  UNIQUE (request_id, due_at)
+);
 CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, operation TEXT NOT NULL, response TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS records_by_subject ON records(subject_id);
 """

@@ -92,6 +92,29 @@ class ServerTests(unittest.TestCase):
         self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
         self.assertEqual("received", self.call("GET", "/requests/req-1")[1]["state"])
 
+    def test_sla_alerts_over_http(self):
+        self.call("POST", "/policies", {"id": "eu", "retention_days": 30, "action": "delete"}, key="p1")
+        self.call("POST", "/requests", {"id": "req-1", "subject_id": "user-1", "request_type": "access",
+                                        "policy_id": "eu", "sla_days": 1, "actor": "agent"}, key="r1")
+        # Clock is frozen at 2026-01-01, due_at is 2026-01-02: not yet overdue.
+        status, body = self.call("POST", "/requests/req-1/sla-alerts", {"actor": "mon", "reason": "late"}, key="a1")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/ghost/sla-alerts", {"actor": "mon", "reason": "late"}, key="a2")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/req-1/sla-alerts", {"actor": "mon"}, key="a3")
+        self.assertEqual((400, "validation_error"), (status, body["error"]["code"]))
+        # Close the request, then the alert is a conflict even though the SLA is breached at close.
+        self.call("POST", "/requests/req-1/transitions", {"action": "cancel", "actor": "dpo", "reason": "x"}, key="t1")
+        status, body = self.call("POST", "/requests/req-1/sla-alerts", {"actor": "mon", "reason": "late"}, key="a4")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, listing = self.call("GET", "/requests/req-1/sla-alerts")
+        self.assertEqual((200, [], {"total": 0, "open": 0, "acknowledged": 0, "count": 0}),
+                         (status, listing["alerts"], listing["totals"]))
+        status, body = self.call("GET", "/requests/ghost/sla-alerts")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/sla-alerts/ghost/acknowledge", {"actor": "dpo", "note": "x"}, key="k1")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+
     def test_content_type_and_query_parameters_are_enforced(self):
         status, body = self.call("POST", "/policies", "{}", key="p1", content_type="text/plain")
         self.assertEqual((400, "Content-Type must be application/json"), (status, body["error"]["message"]))

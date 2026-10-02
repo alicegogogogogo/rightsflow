@@ -398,6 +398,86 @@ class RightsFlow:
             "started_at": row["started_at"], "finished_at": row["finished_at"],
         }
 
+    # --------------------------------------------------------------- sla alerts
+
+    def create_sla_alert(self, request_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Record an overdue fact for an open request; the request itself is never touched."""
+        spec = model.parse_sla_alert(raw)
+        self._load(request_id)
+
+        def create() -> dict[str, Any]:
+            document, _ = self._load(request_id)
+            if document["state"] in TERMINAL:
+                raise ConflictError(
+                    f"request {request_id} is {document['state']}; sla alerts require an open request")
+            due = parse_timestamp(document["sla_due_at"], "sla_due_at")
+            measured = self._now()
+            if measured <= due:
+                raise ConflictError(f"request {request_id} is not overdue")
+            detected_at = format_timestamp(measured)
+            alert_id = "sla-" + evidence_module.sha256_hex(f"{request_id}:{document['sla_due_at']}")[:24]
+            self._insert(
+                "INSERT INTO sla_alerts(alert_id, request_id, subject_id, actor, reason,"
+                " due_at, detected_at, overdue_seconds, status,"
+                " acknowledged_at, acknowledged_by, acknowledged_note)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL)",
+                (alert_id, request_id, document["subject_id"], spec["actor"], spec["reason"],
+                 document["sla_due_at"], detected_at, int((measured - due).total_seconds())),
+                f"sla alert for request {request_id} with due_at {document['sla_due_at']} already exists",
+            )
+            return self._alert_view(self._load_alert(alert_id))
+
+        return self._idempotent(key, f"create-sla-alert:{request_id}", create)
+
+    def sla_alerts(self, request_id: str) -> dict[str, Any]:
+        self._load(request_id)
+        rows = self.store.connection.execute(
+            "SELECT * FROM sla_alerts WHERE request_id = ? ORDER BY detected_at, alert_id", (request_id,)
+        ).fetchall()
+        alerts = [self._alert_view(row) for row in rows]
+        open_count = sum(1 for alert in alerts if alert["status"] == "open")
+        total = len(alerts)
+        return {
+            "request_id": request_id, "alerts": alerts,
+            "totals": {"total": total, "open": open_count,
+                       "acknowledged": total - open_count, "count": total},
+        }
+
+    def acknowledge_sla_alert(self, alert_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        change = model.parse_sla_acknowledge(raw)
+
+        def apply() -> dict[str, Any]:
+            row = self._load_alert(alert_id)
+            if row["status"] == "acknowledged":
+                raise ConflictError(f"sla alert {alert_id} was already acknowledged")
+            acknowledged_at = format_timestamp(self._now())
+            self.store.connection.execute(
+                "UPDATE sla_alerts SET status = 'acknowledged', acknowledged_at = ?,"
+                " acknowledged_by = ?, acknowledged_note = ? WHERE alert_id = ?",
+                (acknowledged_at, change["actor"], change["note"], alert_id),
+            )
+            return self._alert_view(self._load_alert(alert_id))
+
+        return self._idempotent(key, f"acknowledge-sla-alert:{alert_id}", apply)
+
+    def _load_alert(self, alert_id: str) -> Any:
+        row = self.store.connection.execute(
+            "SELECT * FROM sla_alerts WHERE alert_id = ?", (alert_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError(f"sla alert {alert_id} was not found")
+        return row
+
+    def _alert_view(self, row: Any) -> dict[str, Any]:
+        return {
+            "alert_id": row["alert_id"], "request_id": row["request_id"], "subject_id": row["subject_id"],
+            "actor": row["actor"], "reason": row["reason"],
+            "due_at": row["due_at"], "detected_at": row["detected_at"],
+            "overdue_seconds": row["overdue_seconds"], "status": row["status"],
+            "acknowledged_at": row["acknowledged_at"], "acknowledged_by": row["acknowledged_by"],
+            "acknowledged_note": row["acknowledged_note"],
+        }
+
 
 def _history_entry(sequence: int, action: str | None, source: str | None, target: str, actor: str,
                    note: str | None, reason: str | None, details: Any, occurred_at: str) -> dict[str, Any]:

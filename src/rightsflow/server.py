@@ -71,6 +71,12 @@ class Handler(BaseHTTPRequestHandler):
         route = (command, parts[0], parts[2])
         if route == ("GET", "requests", "evidence"):
             return 200, service.evidence(parts[1])
+        if route == ("POST", "requests", "sla-alerts"):
+            return 201, service.create_sla_alert(parts[1], self._body(), key)
+        if route == ("GET", "requests", "sla-alerts"):
+            return 200, service.sla_alerts(parts[1])
+        if route == ("POST", "sla-alerts", "acknowledge"):
+            return 200, service.acknowledge_sla_alert(parts[1], self._body(), key)
         if route == ("POST", "requests", "transitions"):
             return 200, service.transition(parts[1], self._body(), key)
         if route == ("GET", "policy", "due"):

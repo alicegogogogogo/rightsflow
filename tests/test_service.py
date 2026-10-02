@@ -501,5 +501,139 @@ class RetrievalTaskTests(unittest.TestCase):
         self.assertEqual(0, self.service.subject_records("user-42")["count"])
 
 
+class SlaAlertTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = FixedClock("2026-01-01T00:00:00Z")
+        self.service = RightsFlow(str(Path(self.directory.name) / "test.db"), clock=self.clock)
+        self.service.create_policy({"id": "eu-access", "retention_days": 30, "action": "delete"}, "policy-1")
+        self.service.create_request({"id": "req-1", "subject_id": "user-42", "request_type": "access",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def raise_alert(self, request_id="req-1", key=None, **overrides):
+        body = {"actor": "monitor-1", "reason": "past contractual deadline"}
+        body.update(overrides)
+        return self.service.create_sla_alert(request_id, body, key or f"alert-{request_id}")
+
+    def test_create_records_only_the_overdue_fact(self):
+        self.clock.advance(days=31, hours=1)
+        alert = self.raise_alert()
+        self.assertEqual("req-1", alert["request_id"])
+        self.assertEqual("user-42", alert["subject_id"])
+        self.assertEqual("monitor-1", alert["actor"])
+        self.assertEqual("past contractual deadline", alert["reason"])
+        self.assertEqual("2026-01-31T00:00:00Z", alert["due_at"])
+        self.assertEqual("2026-02-01T01:00:00Z", alert["detected_at"])
+        self.assertEqual(86400 + 3600, alert["overdue_seconds"])
+        self.assertEqual("open", alert["status"])
+        self.assertTrue(alert["alert_id"])
+        self.assertEqual((None, None, None),
+                         (alert["acknowledged_at"], alert["acknowledged_by"], alert["acknowledged_note"]))
+        # The request and its evidence chain are untouched.
+        request = self.service.get_request("req-1")
+        self.assertEqual(("received", None), (request["state"], request["closed_at"]))
+        self.assertEqual(1, self.service.evidence("req-1")["count"])
+
+    def test_alert_ids_are_unique_across_requests(self):
+        self.service.create_request({"id": "req-2", "subject_id": "user-7", "request_type": "erasure",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-2")
+        self.clock.advance(days=31)
+        first = self.raise_alert()
+        second = self.raise_alert("req-2")
+        self.assertNotEqual(first["alert_id"], second["alert_id"])
+
+    def test_not_overdue_and_exactly_due_are_conflicts(self):
+        self.clock.advance(days=29)
+        with self.assertRaisesRegex(ConflictError, "not overdue"):
+            self.raise_alert()
+        self.clock.advance(days=1)  # measured_at == due_at is not overdue
+        with self.assertRaisesRegex(ConflictError, "not overdue"):
+            self.raise_alert(key="alert-at-due")
+        self.clock.advance(seconds=1)
+        alert = self.raise_alert(key="alert-just-past")
+        self.assertEqual(1, alert["overdue_seconds"])
+
+    def test_terminal_requests_cannot_raise_alerts(self):
+        for action, body in (("cancel", {"reason": "withdrawn"}),):
+            self.service.transition("req-1", {"action": action, "actor": "dpo", **body}, f"req-1-{action}")
+        self.clock.advance(days=40)
+        with self.assertRaisesRegex(ConflictError, "cancelled"):
+            self.raise_alert()
+
+    def test_one_alert_per_request_and_due_at(self):
+        self.clock.advance(days=31)
+        alert = self.raise_alert()
+        replayed = self.raise_alert()  # same idempotency key replays
+        self.assertEqual(alert, replayed)
+        with self.assertRaisesRegex(ConflictError, "already exists"):
+            self.raise_alert(key="alert-again")
+        self.assertEqual(1, self.service.sla_alerts("req-1")["totals"]["total"])
+
+    def test_create_validation_and_missing_request(self):
+        with self.assertRaisesRegex(ValidationError, "exactly actor and reason"):
+            self.raise_alert(extra="nope")
+        with self.assertRaisesRegex(ValidationError, "actor must be a non-empty string of at most 200"):
+            self.raise_alert(actor="")
+        with self.assertRaisesRegex(ValidationError, "reason must be a non-empty string of at most 1000"):
+            self.raise_alert(reason="x" * 1001)
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.raise_alert("ghost")
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.create_sla_alert("req-1", {"actor": "a", "reason": "r"}, None)
+
+    def test_listing_is_sorted_with_totals(self):
+        empty = self.service.sla_alerts("req-1")
+        self.assertEqual(([], {"total": 0, "open": 0, "acknowledged": 0, "count": 0}),
+                         (empty["alerts"], empty["totals"]))
+        self.service.create_request({"id": "req-2", "subject_id": "user-7", "request_type": "access",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-2")
+        self.clock.advance(days=31)
+        first = self.raise_alert()
+        self.clock.advance(hours=2)
+        second = self.raise_alert("req-2")
+        self.service.acknowledge_sla_alert(first["alert_id"], {"actor": "dpo", "note": "seen"}, "ack-1")
+        listing = self.service.sla_alerts("req-1")
+        self.assertEqual([first["alert_id"]], [alert["alert_id"] for alert in listing["alerts"]])
+        self.assertEqual({"total": 1, "open": 0, "acknowledged": 1, "count": 1}, listing["totals"])
+        other = self.service.sla_alerts("req-2")
+        self.assertEqual([second["alert_id"]], [alert["alert_id"] for alert in other["alerts"]])
+        self.assertEqual({"total": 1, "open": 1, "acknowledged": 0, "count": 1}, other["totals"])
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.service.sla_alerts("ghost")
+
+    def test_acknowledge_marks_alert_without_changing_the_overdue_fact(self):
+        self.clock.advance(days=31)
+        alert = self.raise_alert()
+        self.clock.advance(hours=3)
+        acknowledged = self.service.acknowledge_sla_alert(
+            alert["alert_id"], {"actor": "dpo", "note": "escalated to legal"}, "ack-1")
+        self.assertEqual("acknowledged", acknowledged["status"])
+        self.assertEqual("2026-02-01T03:00:00Z", acknowledged["acknowledged_at"])
+        self.assertEqual("dpo", acknowledged["acknowledged_by"])
+        self.assertEqual("escalated to legal", acknowledged["acknowledged_note"])
+        self.assertEqual((alert["due_at"], alert["detected_at"], alert["overdue_seconds"]),
+                         (acknowledged["due_at"], acknowledged["detected_at"], acknowledged["overdue_seconds"]))
+        stored = self.service.sla_alerts("req-1")["alerts"][0]
+        self.assertEqual(acknowledged, stored)
+
+    def test_acknowledge_errors(self):
+        self.clock.advance(days=31)
+        alert = self.raise_alert()
+        with self.assertRaisesRegex(NotFoundError, "sla alert ghost was not found"):
+            self.service.acknowledge_sla_alert("ghost", {"actor": "dpo", "note": "x"}, "ack-ghost")
+        with self.assertRaisesRegex(ValidationError, "exactly actor and note"):
+            self.service.acknowledge_sla_alert(alert["alert_id"], {"actor": "dpo"}, "ack-bad")
+        with self.assertRaisesRegex(ValidationError, "note must be a non-empty string"):
+            self.service.acknowledge_sla_alert(alert["alert_id"], {"actor": "dpo", "note": ""}, "ack-bad2")
+        self.service.acknowledge_sla_alert(alert["alert_id"], {"actor": "dpo", "note": "seen"}, "ack-1")
+        with self.assertRaisesRegex(ConflictError, "already acknowledged"):
+            self.service.acknowledge_sla_alert(alert["alert_id"], {"actor": "dpo", "note": "again"}, "ack-2")
+        replayed = self.service.acknowledge_sla_alert(alert["alert_id"], {"actor": "x", "note": "y"}, "ack-1")
+        self.assertEqual("dpo", replayed["acknowledged_by"])
+
+
 if __name__ == "__main__":
     unittest.main()
