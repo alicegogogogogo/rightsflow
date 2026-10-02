@@ -62,6 +62,49 @@ From a closed request the successor list is the literal string `none`, e.g.
 `reason` is **required** for `reject`/`cancel` and **forbidden** elsewhere; `details` is
 required for `collect`/`package` and is otherwise absent or `{}`, else `400 validation_error`.
 
+## Retrieval tasks
+
+Before `collect`, a request can track **independent cross-system retrieval tasks** —
+one per source system — under `/requests/{id}/retrieval-tasks`. A task has its own
+lifecycle, `queued -> running -> succeeded | failed`, driven by
+`POST .../retrieval-tasks/{task_id}/start|complete|fail`. Tasks **never** write the
+request: no state change, no evidence entry, no SLA or retention effect; the records a
+succeeded task returns are simply available for a later `collect`.
+
+A task is created with exactly `{"id","system","query","actor"}` (non-empty, at most
+100/100/2000/200 characters); `id` is unique within the request and doubles as the
+`task_id` in the path. Every task view is
+
+```json
+{"request_id":"req-1","task_id":"t-1","system":"crm","status":"succeeded",
+ "records":[{"id":"r-1","payload":{"email":"subject@example.test"}}],"reason":null,
+ "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T01:00:00Z",
+ "started_at":"2026-01-01T00:30:00Z","finished_at":"2026-01-01T01:00:00Z"}
+```
+
+with every timestamp from the injected clock and `null` until the moment it happens.
+`records` is present only on a `succeeded` task, `reason` only on a `failed` one; both
+are `null` otherwise. The action bodies are exactly `{"actor"}` for `start`,
+`{"actor","records"}` for `complete`, and `{"actor","reason"}` for `fail` (`reason`
+non-empty, ≤1000). `records` uses the `collect` shape — an array of `{"id","payload"}`
+objects — except that duplicate ids **keep the first** occurrence instead of failing.
+
+Only `queued -> running`, `running -> succeeded`, and `running -> failed` are legal.
+Anything else — skipping a stage, repeating `start`, writing to a finished task — is
+`409 illegal_transition` with the legal successors listed, and nothing is applied.
+An unknown request or task is `404 not_found`; a duplicate `task_id` is `409 conflict`;
+wrong body keys, types, or lengths are `400 validation_error`.
+
+`GET /requests/{id}/retrieval-tasks` lists tasks sorted by `task_id` plus `totals`:
+
+```json
+{"request_id":"req-1","tasks":[...],
+ "totals":{"total":3,"queued":1,"running":1,"succeeded":1,"failed":0,"completed":1,"progress_percent":33}}
+```
+
+`completed = succeeded + failed`; `progress_percent` is `completed / total` floored to
+a whole percent — `100` once every task is finished, `0` when there are no tasks.
+
 ## Evidence chain
 
 Entry 1 is written when the request is created (`type` `request_received`); every
@@ -199,8 +242,15 @@ request.
 empty) of objects with exactly `id` (unique in the batch) and an object `payload`;
 `package` requires exactly `artifact`, a non-empty string.
 
-`GET /requests/{id}` — the materialized request:
+`POST /requests/{id}/retrieval-tasks` *(key required)* — body exactly
+`{"id":"t-1","system":"crm","query":"email=subject@example.test","actor":"agent-7"}`
+→ `201` with the queued task. `POST /requests/{id}/retrieval-tasks/{task_id}/start`,
+`/complete`, `/fail` *(key required)* — bodies `{"actor"}`,
+`{"actor","records":[...]}`, `{"actor","reason":"..."}` → `200` with the updated task.
+`GET /requests/{id}/retrieval-tasks` — the task list plus `totals`. See *Retrieval
+tasks* above for the lifecycle and field rules.
 
+`GET /requests/{id}` — the materialized request:
 ```json
 {"id":"req-1","subject_id":"user-42","request_type":"access","policy_id":"eu-standard","actor":"agent-7",
  "state":"fulfilled","received_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","closed_at":"2026-01-01T00:00:00Z",
@@ -246,5 +296,6 @@ the injected clock; the response carries `policy_id`, `retention_days`, `action`
 
 `tests/test_service.py` covers the state machine, the hash formula (recomputed
 independently by the test), tamper detection, SLA timing under a frozen clock,
-idempotency, and retention; `tests/test_server.py` exercises the HTTP surface on
-an ephemeral port. The suite runs in about two seconds and needs no network.
+idempotency, retrieval tasks, and retention; `tests/test_server.py` exercises the
+HTTP surface on an ephemeral port. The suite runs in about two seconds and needs
+no network.

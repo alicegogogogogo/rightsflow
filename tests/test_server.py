@@ -73,6 +73,41 @@ class ServerTests(unittest.TestCase):
         self.assertEqual((400, "unknown query parameter(s): when"), (status, body["error"]["message"]))
         self.assertEqual("2026-02-01T00:00:00Z", self.call("GET", "/policy/eu/due?at=2026-02-01T00:00:00Z")[1]["at"])
 
+    def test_retrieval_tasks_over_http(self):
+        self.call("POST", "/policies", {"id": "eu", "retention_days": 30, "action": "delete"}, key="p1")
+        self.call("POST", "/requests", {"id": "req-1", "subject_id": "user-1", "request_type": "access",
+                                        "policy_id": "eu", "sla_days": 30, "actor": "agent"}, key="r1")
+        status, task = self.call("POST", "/requests/req-1/retrieval-tasks",
+                                 {"id": "t-1", "system": "crm", "query": "email=user@example.test",
+                                  "actor": "agent"}, key="task-1")
+        self.assertEqual((201, "queued", None, None),
+                         (status, task["status"], task["started_at"], task["finished_at"]))
+        status, body = self.call("POST", "/requests/req-1/retrieval-tasks",
+                                 {"id": "t-1", "system": "crm", "query": "q", "actor": "agent"}, key="task-2")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, started = self.call("POST", "/requests/req-1/retrieval-tasks/t-1/start",
+                                    {"actor": "dpo"}, key="start-1")
+        self.assertEqual((200, "running", "2026-01-01T00:00:00Z"),
+                         (status, started["status"], started["started_at"]))
+        status, body = self.call("POST", "/requests/req-1/retrieval-tasks/t-1/start",
+                                 {"actor": "dpo"}, key="start-2")
+        self.assertEqual((409, "illegal_transition"), (status, body["error"]["code"]))
+        status, completed = self.call("POST", "/requests/req-1/retrieval-tasks/t-1/complete",
+                                      {"actor": "dpo", "records": [{"id": "r-1", "payload": {"email": "x"}}]},
+                                      key="complete-1")
+        self.assertEqual((200, "succeeded"), (status, completed["status"]))
+        self.assertEqual([{"id": "r-1", "payload": {"email": "x"}}], completed["records"])
+        status, listing = self.call("GET", "/requests/req-1/retrieval-tasks")
+        self.assertEqual((200, 1, 100), (status, listing["totals"]["total"],
+                                         listing["totals"]["progress_percent"]))
+        status, body = self.call("GET", "/requests/ghost/retrieval-tasks")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/req-1/retrieval-tasks/ghost/fail",
+                                 {"actor": "dpo", "reason": "x"}, key="fail-1")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        # The request itself is untouched by task activity.
+        self.assertEqual("received", self.call("GET", "/requests/req-1")[1]["state"])
+
 
 if __name__ == "__main__":
     unittest.main()

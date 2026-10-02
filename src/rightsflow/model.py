@@ -12,6 +12,9 @@ REASON_ACTIONS = ("reject", "cancel")
 REQUEST_FIELDS = ("id", "subject_id", "request_type", "policy_id", "sla_days", "actor")
 POLICY_FIELDS = ("id", "retention_days", "action")
 TRANSITION_FIELDS = ("action", "actor", "note", "reason", "details")
+RETRIEVAL_TASK_FIELDS = ("id", "system", "query", "actor")
+TASK_ACTION_FIELDS = {"start": ("actor",), "complete": ("actor", "records"), "fail": ("actor", "reason")}
+TASK_ACTION_TARGETS = {"start": "running", "complete": "succeeded", "fail": "failed"}
 
 ACTION_TARGETS = {
     "verify_identity": "identity_verified",
@@ -35,10 +38,23 @@ TRANSITIONS: dict[str, tuple[str, ...]] = {
     "cancelled": (),
 }
 
+# Retrieval-task lifecycle: queued -> running -> succeeded | failed.
+TASK_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "queued": ("running",),
+    "running": ("succeeded", "failed"),
+    "succeeded": (),
+    "failed": (),
+}
+
 
 def successors(state: str) -> list[str]:
     """Legal successor states, lexicographically sorted."""
     return sorted(TRANSITIONS.get(state, ()))
+
+
+def task_successors(status: str) -> list[str]:
+    """Legal successor task statuses, lexicographically sorted."""
+    return sorted(TASK_TRANSITIONS.get(status, ()))
 
 
 def identifier(value: Any, field: str) -> str:
@@ -148,3 +164,42 @@ def _package_details(details: Any) -> dict[str, Any]:
     if not isinstance(details, dict) or set(details) != {"artifact"}:
         raise ValidationError("package requires details containing exactly artifact")
     return {"artifact": text(details["artifact"], "artifact", 200)}
+
+
+def parse_retrieval_task(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != set(RETRIEVAL_TASK_FIELDS):
+        raise ValidationError("retrieval task must contain exactly id, system, query, and actor")
+    return {"id": identifier(raw["id"], "task id"), "system": text(raw["system"], "system", 100),
+            "query": text(raw["query"], "query", 2000), "actor": text(raw["actor"], "actor", 200)}
+
+
+def parse_task_action(raw: Any, action: str) -> dict[str, Any]:
+    """Validate one retrieval-task action body: exactly the fields the action takes."""
+    fields = TASK_ACTION_FIELDS[action]
+    if not isinstance(raw, dict) or set(raw) != set(fields):
+        raise ValidationError(f"{action} must contain exactly {', '.join(fields)}")
+    parsed: dict[str, Any] = {"actor": text(raw["actor"], "actor", 200)}
+    if action == "complete":
+        parsed["records"] = _task_records(raw["records"])
+    elif action == "fail":
+        parsed["reason"] = text(raw["reason"], "reason", 1000)
+    return parsed
+
+
+def _task_records(raw: Any) -> list[dict[str, Any]]:
+    """Records in the collect shape; duplicate ids keep the first occurrence."""
+    if not isinstance(raw, list):
+        raise ValidationError("records must be an array")
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for position, item in enumerate(raw, start=1):
+        if not isinstance(item, dict) or set(item) != {"id", "payload"}:
+            raise ValidationError(f"record {position} must contain exactly id and payload")
+        record_id = identifier(item["id"], f"record {position} id")
+        if not isinstance(item["payload"], dict):
+            raise ValidationError(f"record {record_id} payload must be an object")
+        if record_id in seen:
+            continue
+        seen.add(record_id)
+        records.append({"id": record_id, "payload": item["payload"]})
+    return records

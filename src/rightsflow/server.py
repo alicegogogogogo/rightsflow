@@ -58,6 +58,14 @@ class Handler(BaseHTTPRequestHandler):
             return 200, service.verify_evidence(self._body())
         if command == "GET" and len(parts) == 2 and parts[0] == "requests":
             return 200, service.get_request(parts[1])
+        if len(parts) == 3 and parts[0] == "requests" and parts[2] == "retrieval-tasks":
+            if command == "GET":
+                return 200, service.retrieval_tasks(parts[1])
+            if command == "POST":
+                return 201, service.create_retrieval_task(parts[1], self._body(), key)
+        if (command == "POST" and len(parts) == 5 and parts[0] == "requests"
+                and parts[2] == "retrieval-tasks" and parts[4] in ("start", "complete", "fail")):
+            return 200, service.retrieval_task_action(parts[1], parts[3], parts[4], self._body(), key)
         if len(parts) != 3:
             raise NotFoundError("route was not found")
         route = (command, parts[0], parts[2])
