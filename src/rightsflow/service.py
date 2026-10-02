@@ -314,6 +314,90 @@ class RightsFlow:
                     **_record_view(row, self.store)} for row in rows]
         return {"subject_id": subject_id, "count": len(records), "records": records}
 
+    # ----------------------------------------------------------- retrieval tasks
+
+    def create_retrieval_task(self, request_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Track a cross-system retrieval that feeds `collect` without touching the request."""
+        spec = model.parse_retrieval_task(raw)
+        self._load(request_id)
+
+        def create() -> dict[str, Any]:
+            now = format_timestamp(self._now())
+            self._insert(
+                "INSERT INTO retrieval_tasks(request_id, task_id, system, query, actor, status,"
+                " records, reason, created_at, updated_at, started_at, finished_at)"
+                " VALUES (?, ?, ?, ?, ?, 'queued', NULL, NULL, ?, ?, NULL, NULL)",
+                (request_id, spec["id"], spec["system"], spec["query"], spec["actor"], now, now),
+                f"retrieval task {spec['id']} already exists",
+            )
+            return self._task_view(self._load_task(request_id, spec["id"]))
+
+        return self._idempotent(key, f"create-retrieval-task:{request_id}:{spec['id']}", create)
+
+    def retrieval_task_action(
+        self, request_id: str, task_id: str, action: str, raw: Any, key: str | None
+    ) -> dict[str, Any]:
+        change = model.parse_retrieval_action(action, raw)
+        target = model.TASK_ACTION_TARGETS[action]
+
+        def apply() -> dict[str, Any]:
+            task = self._load_task(request_id, task_id)
+            source = task["status"]
+            if target not in model.TASK_TRANSITIONS.get(source, ()):
+                legal = ", ".join(sorted(model.TASK_TRANSITIONS.get(source, ()))) or "none"
+                raise IllegalTransitionError(
+                    f"illegal transition from {source} to {target}; legal successors: {legal}")
+            occurred_at = format_timestamp(self._now())
+            self.store.connection.execute(
+                "UPDATE retrieval_tasks SET status = ?, records = ?, reason = ?,"
+                " updated_at = ?, started_at = ?, finished_at = ? WHERE request_id = ? AND task_id = ?",
+                (target,
+                 self.store.encode(change["records"]) if action == "complete" else task["records"],
+                 change.get("reason") if action == "fail" else task["reason"],
+                 occurred_at,
+                 occurred_at if action == "start" else task["started_at"],
+                 occurred_at if action in ("complete", "fail") else task["finished_at"],
+                 request_id, task_id),
+            )
+            return self._task_view(self._load_task(request_id, task_id))
+
+        return self._idempotent(key, f"retrieval-task-{action}:{request_id}:{task_id}", apply)
+
+    def retrieval_tasks(self, request_id: str) -> dict[str, Any]:
+        self._load(request_id)
+        rows = self.store.connection.execute(
+            "SELECT * FROM retrieval_tasks WHERE request_id = ? ORDER BY task_id", (request_id,)
+        ).fetchall()
+        tasks = [self._task_view(row) for row in rows]
+        counts = {status: sum(1 for task in tasks if task["status"] == status)
+                  for status in ("queued", "running", "succeeded", "failed")}
+        completed = counts["succeeded"] + counts["failed"]
+        total = len(tasks)
+        return {
+            "request_id": request_id, "tasks": tasks,
+            "totals": {"total": total, **counts, "completed": completed,
+                       "progress_percent": completed * 100 // total if total else 0},
+        }
+
+    def _load_task(self, request_id: str, task_id: str) -> Any:
+        self._load(request_id)
+        row = self.store.connection.execute(
+            "SELECT * FROM retrieval_tasks WHERE request_id = ? AND task_id = ?", (request_id, task_id)
+        ).fetchone()
+        if not row:
+            raise NotFoundError(f"retrieval task {task_id} was not found")
+        return row
+
+    def _task_view(self, row: Any) -> dict[str, Any]:
+        return {
+            "request_id": row["request_id"], "task_id": row["task_id"], "system": row["system"],
+            "status": row["status"],
+            "records": self.store.decode(row["records"]) if row["records"] is not None else None,
+            "reason": row["reason"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "started_at": row["started_at"], "finished_at": row["finished_at"],
+        }
+
 
 def _history_entry(sequence: int, action: str | None, source: str | None, target: str, actor: str,
                    note: str | None, reason: str | None, details: Any, occurred_at: str) -> dict[str, Any]:

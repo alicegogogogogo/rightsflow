@@ -340,5 +340,166 @@ class RightsFlowTests(unittest.TestCase):
             self.service.enforce_policy("ghost", {"at": "2026-01-31T00:00:00Z"}, "bad3")
 
 
+class RetrievalTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = FixedClock("2026-01-01T00:00:00Z")
+        self.service = RightsFlow(str(Path(self.directory.name) / "test.db"), clock=self.clock)
+        self.service.create_policy({"id": "eu-access", "retention_days": 30, "action": "delete"}, "policy-1")
+        self.service.create_request({"id": "req-1", "subject_id": "user-42", "request_type": "access",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def create(self, task_id="task-1", key=None, **overrides):
+        body = {"id": task_id, "system": "crm", "query": "email = subject@example.test", "actor": "agent-7"}
+        body.update(overrides)
+        return self.service.create_retrieval_task("req-1", body, key or f"create-{task_id}")
+
+    def act(self, action, task_id="task-1", key=None, **body):
+        return self.service.retrieval_task_action(
+            "req-1", task_id, action, {"actor": "worker-1", **body}, key or f"{task_id}-{action}")
+
+    def test_create_returns_queued_task_with_clock_timestamps(self):
+        task = self.create()
+        self.assertEqual({"request_id": "req-1", "task_id": "task-1", "system": "crm", "status": "queued",
+                          "records": None, "reason": None,
+                          "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+                          "started_at": None, "finished_at": None}, task)
+
+    def test_create_validation_and_conflicts(self):
+        with self.assertRaisesRegex(ValidationError, "exactly id, system, query, and actor"):
+            self.create(extra="nope")
+        with self.assertRaisesRegex(ValidationError, "system must be a non-empty string"):
+            self.create(system="")
+        with self.assertRaisesRegex(ValidationError, "query must be a non-empty string of at most 2000"):
+            self.create(query="x" * 2001)
+        with self.assertRaisesRegex(ValidationError, "actor must be a non-empty string of at most 200"):
+            self.create(actor="x" * 201)
+        with self.assertRaisesRegex(ValidationError, "task id must be a non-empty string of at most 100"):
+            self.create(task_id="x" * 101)
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.service.create_retrieval_task(
+                "ghost", {"id": "t", "system": "crm", "query": "q", "actor": "a"}, "ghost-task")
+        self.create()
+        with self.assertRaisesRegex(ConflictError, "retrieval task task-1 already exists"):
+            self.create(key="another-key")
+
+    def test_start_complete_flow_and_timestamps(self):
+        self.create()
+        self.clock.advance(hours=1)
+        started = self.act("start")
+        self.assertEqual(("running", "2026-01-01T01:00:00Z", "2026-01-01T01:00:00Z", None),
+                         (started["status"], started["started_at"], started["updated_at"], started["finished_at"]))
+        self.clock.advance(hours=2)
+        records = [{"id": "r-1", "payload": {"email": "subject@example.test"}}]
+        done = self.act("complete", records=records)
+        self.assertEqual(("succeeded", records, "2026-01-01T03:00:00Z", "2026-01-01T01:00:00Z"),
+                         (done["status"], done["records"], done["finished_at"], done["started_at"]))
+
+    def test_complete_records_keep_first_of_each_id(self):
+        self.create()
+        self.act("start")
+        batch = [{"id": "r-1", "payload": {"v": 1}}, {"id": "r-1", "payload": {"v": 2}},
+                 {"id": "r-2", "payload": {"v": 3}}]
+        done = self.act("complete", records=batch)
+        self.assertEqual([{"id": "r-1", "payload": {"v": 1}}, {"id": "r-2", "payload": {"v": 3}}], done["records"])
+        with self.assertRaisesRegex(ValidationError, "records must be an array"):
+            self.service.retrieval_task_action("req-1", "task-1", "complete",
+                                               {"actor": "a", "records": {}}, "bad-records")
+        with self.assertRaisesRegex(ValidationError, "exactly id and payload"):
+            self.service.retrieval_task_action("req-1", "task-1", "complete",
+                                               {"actor": "a", "records": [{"id": "r"}]}, "bad-record")
+
+    def test_fail_requires_reason_and_records_terminal_view(self):
+        self.create()
+        with self.assertRaisesRegex(ValidationError, "fail must contain exactly actor, reason"):
+            self.act("fail")
+        self.act("start")
+        with self.assertRaisesRegex(ValidationError, "reason must be a non-empty string of at most 1000"):
+            self.act("fail", key="fail-empty", reason="")
+        failed = self.act("fail", reason="system timeout")
+        self.assertEqual(("failed", "system timeout", None), (failed["status"], failed["reason"], failed["records"]))
+        self.assertIsNotNone(failed["finished_at"])
+
+    def test_action_bodies_are_strict(self):
+        self.create()
+        with self.assertRaisesRegex(ValidationError, "start must contain exactly actor"):
+            self.act("start", note="extra")
+        with self.assertRaisesRegex(ValidationError, "complete must contain exactly actor, records"):
+            self.act("complete")
+        with self.assertRaisesRegex(ValidationError, "actor must be a non-empty string"):
+            self.act("start", actor="")
+
+    def test_illegal_task_transitions_change_nothing(self):
+        self.create()
+        with self.assertRaisesRegex(
+                IllegalTransitionError,
+                "illegal transition from queued to succeeded; legal successors: running"):
+            self.act("complete", records=[])
+        self.act("start")
+        with self.assertRaisesRegex(IllegalTransitionError,
+                                    "illegal transition from running to running; legal successors: failed, succeeded"):
+            self.act("start", key="start-again")
+        self.act("complete", records=[])
+        for action, body in (("start", {}), ("complete", {"records": []}), ("fail", {"reason": "late"})):
+            with self.assertRaisesRegex(IllegalTransitionError, "legal successors: none"):
+                self.act(action, key=f"late-{action}", **body)
+        task = self.service.retrieval_tasks("req-1")["tasks"][0]
+        self.assertEqual(("succeeded", "2026-01-01T00:00:00Z"), (task["status"], task["updated_at"]))
+
+    def test_missing_request_or_task_is_not_found(self):
+        self.create()
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.service.retrieval_tasks("ghost")
+        with self.assertRaisesRegex(NotFoundError, "retrieval task ghost was not found"):
+            self.act("start", task_id="ghost")
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.service.retrieval_task_action("ghost", "task-1", "start", {"actor": "a"}, "ghost-start")
+
+    def test_idempotency_replays_without_reapplying(self):
+        self.create()
+        first = self.act("start")
+        self.assertEqual(first, self.act("start", key="task-1-start", actor="someone-else"))
+        self.assertEqual("running", self.service.retrieval_tasks("req-1")["tasks"][0]["status"])
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.retrieval_task_action("req-1", "task-1", "complete",
+                                               {"actor": "a", "records": []}, None)
+        with self.assertRaises(ConflictError):
+            self.act("complete", key="task-1-start", records=[])
+
+    def test_listing_is_sorted_with_totals_and_progress(self):
+        empty = self.service.retrieval_tasks("req-1")
+        self.assertEqual({"total": 0, "queued": 0, "running": 0, "succeeded": 0, "failed": 0,
+                          "completed": 0, "progress_percent": 0}, empty["totals"])
+        self.create("task-c")
+        self.create("task-a")
+        self.create("task-b")
+        self.act("start", "task-a")
+        self.act("complete", "task-a", records=[{"id": "r-1", "payload": {}}])
+        self.act("start", "task-b")
+        self.act("fail", "task-b", reason="unreachable")
+        listing = self.service.retrieval_tasks("req-1")
+        self.assertEqual(["task-a", "task-b", "task-c"], [task["task_id"] for task in listing["tasks"]])
+        self.assertEqual({"total": 3, "queued": 1, "running": 0, "succeeded": 1, "failed": 1,
+                          "completed": 2, "progress_percent": 66}, listing["totals"])
+        self.assertEqual([{"id": "r-1", "payload": {}}], listing["tasks"][0]["records"])
+        self.assertEqual("unreachable", listing["tasks"][1]["reason"])
+        self.assertIsNone(listing["tasks"][2]["records"])
+        self.act("start", "task-c")
+        self.act("complete", "task-c", records=[])
+        self.assertEqual(100, self.service.retrieval_tasks("req-1")["totals"]["progress_percent"])
+
+    def test_tasks_never_touch_the_request(self):
+        self.create()
+        self.act("start")
+        self.act("complete", records=[{"id": "r-1", "payload": {"email": "subject@example.test"}}])
+        request = self.service.get_request("req-1")
+        self.assertEqual(("received", [], None), (request["state"], request["records"], request["collection"]))
+        self.assertEqual(1, self.service.evidence("req-1")["count"])
+        self.assertEqual(0, self.service.subject_records("user-42")["count"])
+
+
 if __name__ == "__main__":
     unittest.main()

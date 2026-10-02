@@ -199,6 +199,49 @@ request.
 empty) of objects with exactly `id` (unique in the batch) and an object `payload`;
 `package` requires exactly `artifact`, a non-empty string.
 
+## Retrieval tasks
+
+Before `collect`, a request can track **independent cross-system retrieval
+tasks** that record where source data is being fetched from. A task has its own
+lifecycle — `queued → running → succeeded | failed` — and never writes request
+data: no state change, no evidence entry, no effect on SLA or retention. Its
+`records` simply become available for a later `collect`.
+
+`POST /requests/{id}/retrieval-tasks` *(key required)* — the body must contain
+exactly `{"id","system","query","actor"}`, all non-empty strings of at most
+100, 100, 2000, and 200 characters. The `id` is unique within the request and
+doubles as the `task_id`. Answer `201` with the task in `queued`:
+
+```json
+{"request_id":"req-1","task_id":"t-1","system":"crm","status":"queued","records":null,"reason":null,
+ "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","started_at":null,"finished_at":null}
+```
+
+Every timestamp comes from the injected clock; one that has not happened yet is
+`null`. A duplicate `task_id` is `409 conflict`.
+
+`POST /requests/{id}/retrieval-tasks/{task_id}/start|complete|fail` *(key
+required)* — the bodies are exactly `{"actor"}`, `{"actor","records"}`, and
+`{"actor","reason"}`, and the only legal transitions are `queued → running`,
+`running → succeeded`, and `running → failed`. `records` has the same shape as
+`collect`'s — objects with exactly `id` and an object `payload` — except that a
+repeated `id` keeps the **first** occurrence instead of failing. `reason` is a
+non-empty string of at most 1000 characters. Skipping a step, repeating
+`start`, or acting on a terminal task is `409 illegal_transition` and changes
+nothing; a missing request or task is `404 not_found`.
+
+`GET /requests/{id}/retrieval-tasks` — the tasks sorted by `task_id`, where a
+`succeeded` task carries its `records`, a `failed` task its `reason`, and every
+other field is `null`, plus aggregate `totals`:
+
+```json
+{"request_id":"req-1","tasks":[...],
+ "totals":{"total":3,"queued":1,"running":0,"succeeded":1,"failed":1,"completed":2,"progress_percent":66}}
+```
+
+`completed = succeeded + failed`; `progress_percent` is the completed share
+rounded down — `100` once every task is terminal, `0` when there are no tasks.
+
 `GET /requests/{id}` — the materialized request:
 
 ```json

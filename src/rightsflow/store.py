@@ -23,6 +23,14 @@ CREATE TABLE IF NOT EXISTS records (
   subject_id TEXT NOT NULL, payload TEXT NOT NULL, anonymized INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (request_id, record_id)
 );
+CREATE TABLE IF NOT EXISTS retrieval_tasks (
+  request_id TEXT NOT NULL REFERENCES requests(id), task_id TEXT NOT NULL,
+  system TEXT NOT NULL, query TEXT NOT NULL, actor TEXT NOT NULL,
+  status TEXT NOT NULL, records TEXT, reason TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  started_at TEXT, finished_at TEXT,
+  PRIMARY KEY (request_id, task_id)
+);
 CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, operation TEXT NOT NULL, response TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS records_by_subject ON records(subject_id);
 """
