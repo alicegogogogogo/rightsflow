@@ -92,6 +92,43 @@ class ServerTests(unittest.TestCase):
         self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
         self.assertEqual("received", self.call("GET", "/requests/req-1")[1]["state"])
 
+    def test_sla_alerts_over_http(self):
+        self.call("POST", "/policies", {"id": "eu", "retention_days": 30, "action": "delete"}, key="p1")
+        self.call("POST", "/requests", {"id": "req-1", "subject_id": "user-1", "request_type": "access",
+                                        "policy_id": "eu", "sla_days": 30, "actor": "agent"}, key="r1")
+        status, body = self.call("POST", "/requests/req-1/sla-alerts", {"actor": "m", "reason": "late"}, key="a1")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/ghost/sla-alerts", {"actor": "m", "reason": "late"}, key="a2")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/req-1/sla-alerts", {"actor": "m"}, key="a3")
+        self.assertEqual((400, "validation_error"), (status, body["error"]["code"]))
+        Handler.service.clock.advance(days=31)
+        status, alert = self.call("POST", "/requests/req-1/sla-alerts", {"actor": "m", "reason": "late"}, key="a4")
+        self.assertEqual((201, "open", "2026-02-01T00:00:00Z", 86400),
+                         (status, alert["status"], alert["detected_at"], alert["overdue_seconds"]))
+        status, body = self.call("POST", "/requests/req-1/sla-alerts", {"actor": "m", "reason": "late"}, key="a5")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, listing = self.call("GET", "/requests/req-1/sla-alerts")
+        self.assertEqual((200, 1, 1, 0), (status, listing["totals"]["total"],
+                                          listing["totals"]["open"], listing["totals"]["acknowledged"]))
+        self.assertEqual(alert["alert_id"], listing["alerts"][0]["alert_id"])
+        status, body = self.call("GET", "/requests/ghost/sla-alerts")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        status, acknowledged = self.call("POST", f"/sla-alerts/{alert['alert_id']}/acknowledge",
+                                         {"actor": "dpo", "note": "on it"}, key="a6")
+        self.assertEqual((200, "acknowledged", "dpo", "on it"),
+                         (status, acknowledged["status"], acknowledged["acknowledged_by"],
+                          acknowledged["acknowledged_note"]))
+        self.assertEqual((alert["due_at"], alert["detected_at"], alert["overdue_seconds"]),
+                         (acknowledged["due_at"], acknowledged["detected_at"], acknowledged["overdue_seconds"]))
+        status, body = self.call("POST", f"/sla-alerts/{alert['alert_id']}/acknowledge",
+                                 {"actor": "dpo", "note": "again"}, key="a7")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/sla-alerts/ghost/acknowledge", {"actor": "dpo", "note": "x"}, key="a8")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        self.assertEqual("received", self.call("GET", "/requests/req-1")[1]["state"])
+        self.assertEqual(1, self.call("GET", "/requests/req-1/evidence")[1]["count"])
+
     def test_content_type_and_query_parameters_are_enforced(self):
         status, body = self.call("POST", "/policies", "{}", key="p1", content_type="text/plain")
         self.assertEqual((400, "Content-Type must be application/json"), (status, body["error"]["message"]))

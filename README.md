@@ -242,6 +242,47 @@ other field is `null`, plus aggregate `totals`:
 `completed = succeeded + failed`; `progress_percent` is the completed share
 rounded down — `100` once every task is terminal, `0` when there are no tasks.
 
+## SLA alerts
+
+An **SLA alert** records one overdue fact about an open request. Alerts live in
+their own store: creating or acknowledging one never changes the request state,
+appends no evidence entry, and triggers no retention action.
+
+`POST /requests/{id}/sla-alerts` *(key required)* — the body must contain
+exactly `{"actor","reason"}`, non-empty strings of at most 200 and 1000
+characters. The request must exist (`404 not_found`), must not be in a terminal
+state (`fulfilled`/`rejected`/`cancelled` → `409 conflict`), and must be
+**strictly** overdue against the injected clock: `measured_at > due_at`, so
+measuring exactly at `due_at` is `409 conflict`. Answer `201`:
+
+```json
+{"alert_id":"sla-…","request_id":"req-1","subject_id":"user-42","actor":"monitor-1","reason":"past the contractual deadline",
+ "due_at":"2026-01-31T00:00:00Z","detected_at":"2026-02-01T00:00:00Z","overdue_seconds":86400,"status":"open"}
+```
+
+`alert_id` is globally unique, `detected_at` equals `measured_at`, and
+`overdue_seconds` is the whole-second difference `measured_at - due_at`. A
+request keeps at most one alert per `due_at`; a second attempt is `409
+conflict`.
+
+`GET /requests/{id}/sla-alerts` — the alerts sorted by `detected_at` then
+`alert_id`, plus aggregate `totals` where `count` equals `total`:
+
+```json
+{"request_id":"req-1","alerts":[...],
+ "totals":{"total":1,"open":0,"acknowledged":1,"count":1}}
+```
+
+A request with no alerts answers an empty array and zero totals; a missing
+request is `404 not_found`.
+
+`POST /sla-alerts/{alert_id}/acknowledge` *(key required)* — the body must
+contain exactly `{"actor","note"}`. Answer `200` with the alert now in
+`acknowledged`, carrying `acknowledged_at` (the injected clock),
+`acknowledged_by`, and `acknowledged_note`; `due_at`, `detected_at`, and
+`overdue_seconds` are unchanged. A missing alert is `404 not_found` and a
+repeat acknowledgement is `409 conflict`.
+
 `GET /requests/{id}` — the materialized request:
 
 ```json
@@ -289,5 +330,6 @@ the injected clock; the response carries `policy_id`, `retention_days`, `action`
 
 `tests/test_service.py` covers the state machine, the hash formula (recomputed
 independently by the test), tamper detection, SLA timing under a frozen clock,
-idempotency, and retention; `tests/test_server.py` exercises the HTTP surface on
-an ephemeral port. The suite runs in about two seconds and needs no network.
+idempotency, retention, retrieval tasks, and SLA alerts; `tests/test_server.py`
+exercises the HTTP surface on an ephemeral port. The suite runs in about two
+seconds and needs no network.

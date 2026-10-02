@@ -501,5 +501,158 @@ class RetrievalTaskTests(unittest.TestCase):
         self.assertEqual(0, self.service.subject_records("user-42")["count"])
 
 
+class SlaAlertTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = FixedClock("2026-01-01T00:00:00Z")
+        self.service = RightsFlow(str(Path(self.directory.name) / "test.db"), clock=self.clock)
+        self.service.create_policy({"id": "eu-access", "retention_days": 30, "action": "delete"}, "policy-1")
+        self.service.create_request({"id": "req-1", "subject_id": "user-42", "request_type": "access",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def create(self, request_id="req-1", key=None, **overrides):
+        body = {"actor": "monitor-1", "reason": "past the contractual deadline"}
+        body.update(overrides)
+        return self.service.create_sla_alert(request_id, body, key or f"alert-{request_id}")
+
+    def acknowledge(self, alert_id, key=None, **overrides):
+        body = {"actor": "dpo", "note": "team notified"}
+        body.update(overrides)
+        return self.service.acknowledge_sla_alert(alert_id, body, key or f"ack-{alert_id}")
+
+    def test_create_records_exactly_the_overdue_fact(self):
+        self.service.create_request({"id": "req-2", "subject_id": "user-7", "request_type": "erasure",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-2")
+        self.clock.advance(days=31)
+        alert = self.create()
+        self.assertEqual(
+            {"alert_id", "request_id", "subject_id", "actor", "reason",
+             "due_at", "detected_at", "overdue_seconds", "status"},
+            set(alert))
+        self.assertEqual(("req-1", "user-42", "monitor-1", "past the contractual deadline", "open"),
+                         (alert["request_id"], alert["subject_id"], alert["actor"],
+                          alert["reason"], alert["status"]))
+        self.assertEqual(("2026-01-31T00:00:00Z", "2026-02-01T00:00:00Z", 86400),
+                         (alert["due_at"], alert["detected_at"], alert["overdue_seconds"]))
+        self.assertTrue(alert["alert_id"])
+        other = self.create("req-2")
+        self.assertNotEqual(alert["alert_id"], other["alert_id"])
+
+    def test_create_leaves_request_evidence_and_records_untouched(self):
+        self.clock.advance(days=40)
+        self.create()
+        request = self.service.get_request("req-1")
+        self.assertEqual(("received", None, None), (request["state"], request["closed_at"], request["retention"]))
+        self.assertEqual(1, self.service.evidence("req-1")["count"])
+        self.assertEqual(0, self.service.subject_records("user-42")["count"])
+
+    def test_create_requires_measured_at_strictly_after_due(self):
+        self.clock.advance(days=29)
+        with self.assertRaisesRegex(ConflictError, "not overdue"):
+            self.create(key="early")
+        self.clock.advance(days=1)  # exactly at due_at
+        with self.assertRaisesRegex(ConflictError, "not overdue"):
+            self.create(key="at-due")
+        self.clock.advance(seconds=1)
+        self.assertEqual(1, self.create()["overdue_seconds"])
+
+    def test_create_rejects_terminal_states_and_missing_requests(self):
+        self.clock.advance(days=31)
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.create("ghost")
+        self.service.transition("req-1", {"action": "cancel", "actor": "subject", "reason": "withdrawn"}, "cancel-1")
+        with self.assertRaisesRegex(ConflictError, "cancelled"):
+            self.create()
+
+    def test_create_validates_the_body_strictly(self):
+        self.clock.advance(days=31)
+        with self.assertRaisesRegex(ValidationError, "exactly actor and reason"):
+            self.create(extra="nope")
+        with self.assertRaisesRegex(ValidationError, "exactly actor and reason"):
+            self.service.create_sla_alert("req-1", {"actor": "m"}, "missing-reason")
+        with self.assertRaisesRegex(ValidationError, "actor must be a non-empty string of at most 200"):
+            self.create(actor="")
+        with self.assertRaisesRegex(ValidationError, "actor must be a non-empty string of at most 200"):
+            self.create(actor="x" * 201)
+        with self.assertRaisesRegex(ValidationError, "reason must be a non-empty string of at most 1000"):
+            self.create(reason="x" * 1001)
+
+    def test_one_alert_per_request_and_due_at(self):
+        self.clock.advance(days=31)
+        first = self.create()
+        with self.assertRaisesRegex(ConflictError, "already exists"):
+            self.create(key="another-key")
+        replayed = self.create(key="alert-req-1", reason="different body, same key")
+        self.assertEqual(first, replayed)
+        self.assertEqual(1, self.service.sla_alerts("req-1")["totals"]["total"])
+
+    def test_listing_is_empty_then_counts_by_status(self):
+        empty = self.service.sla_alerts("req-1")
+        self.assertEqual({"request_id": "req-1", "alerts": [],
+                          "totals": {"total": 0, "open": 0, "acknowledged": 0, "count": 0}}, empty)
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.service.sla_alerts("ghost")
+        self.clock.advance(days=31)
+        created = self.create()
+        listing = self.service.sla_alerts("req-1")
+        self.assertEqual({"total": 1, "open": 1, "acknowledged": 0, "count": 1}, listing["totals"])
+        alert = listing["alerts"][0]
+        self.assertEqual(created["alert_id"], alert["alert_id"])
+        self.assertEqual((None, None, None),
+                         (alert["acknowledged_at"], alert["acknowledged_by"], alert["acknowledged_note"]))
+        self.clock.advance(hours=2)
+        self.acknowledge(created["alert_id"])
+        listing = self.service.sla_alerts("req-1")
+        self.assertEqual({"total": 1, "open": 0, "acknowledged": 1, "count": 1}, listing["totals"])
+        self.assertEqual("acknowledged", listing["alerts"][0]["status"])
+
+    def test_acknowledge_records_the_fact_without_changing_the_overdue_data(self):
+        self.clock.advance(days=31)
+        created = self.create()
+        self.clock.advance(hours=3)
+        acknowledged = self.acknowledge(created["alert_id"])
+        self.assertEqual(("acknowledged", "2026-02-01T03:00:00Z", "dpo", "team notified"),
+                         (acknowledged["status"], acknowledged["acknowledged_at"],
+                          acknowledged["acknowledged_by"], acknowledged["acknowledged_note"]))
+        self.assertEqual((created["due_at"], created["detected_at"], created["overdue_seconds"]),
+                         (acknowledged["due_at"], acknowledged["detected_at"], acknowledged["overdue_seconds"]))
+        self.assertEqual(1, self.service.evidence("req-1")["count"])
+        self.assertEqual("received", self.service.get_request("req-1")["state"])
+
+    def test_acknowledge_conflicts_on_repeat_and_404s_on_unknown_alerts(self):
+        self.clock.advance(days=31)
+        created = self.create()
+        self.acknowledge(created["alert_id"])
+        with self.assertRaisesRegex(ConflictError, "already acknowledged"):
+            self.acknowledge(created["alert_id"], key="ack-again")
+        with self.assertRaisesRegex(NotFoundError, "SLA alert ghost was not found"):
+            self.acknowledge("ghost")
+        replayed = self.acknowledge(created["alert_id"], key=f"ack-{created['alert_id']}")
+        self.assertEqual("acknowledged", replayed["status"])
+
+    def test_acknowledge_validates_the_body_strictly(self):
+        self.clock.advance(days=31)
+        created = self.create()
+        with self.assertRaisesRegex(ValidationError, "exactly actor and note"):
+            self.acknowledge(created["alert_id"], reason="wrong field")
+        with self.assertRaisesRegex(ValidationError, "actor must be a non-empty string of at most 200"):
+            self.acknowledge(created["alert_id"], actor="")
+        with self.assertRaisesRegex(ValidationError, "note must be a non-empty string of at most 2000"):
+            self.acknowledge(created["alert_id"], note="")
+
+    def test_idempotency_rules_apply_to_both_endpoints(self):
+        self.clock.advance(days=31)
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.create_sla_alert("req-1", {"actor": "m", "reason": "late"}, None)
+        created = self.create()
+        with self.assertRaises(ConflictError):
+            self.service.acknowledge_sla_alert(created["alert_id"], {"actor": "dpo", "note": "n"}, "alert-req-1")
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.acknowledge_sla_alert(created["alert_id"], {"actor": "dpo", "note": "n"}, None)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterator
 
@@ -396,6 +397,96 @@ class RightsFlow:
             "reason": row["reason"],
             "created_at": row["created_at"], "updated_at": row["updated_at"],
             "started_at": row["started_at"], "finished_at": row["finished_at"],
+        }
+
+    # ---------------------------------------------------------------- SLA alerts
+
+    def create_sla_alert(self, request_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Record one overdue fact for an open request.
+
+        The alert is stored on its own; nothing here changes the request state,
+        appends evidence, or triggers retention. Only the injected clock decides
+        whether the request is overdue, and the deadline is strict: measuring
+        exactly at `due_at` is not overdue.
+        """
+        spec = model.parse_sla_alert(raw)
+
+        def create() -> dict[str, Any]:
+            document, _ = self._load(request_id)
+            if document["state"] in TERMINAL:
+                raise ConflictError(
+                    f"request {request_id} is {document['state']}; SLA alerts require an open request")
+            measured = self._now()
+            due = parse_timestamp(document["sla_due_at"], "sla_due_at")
+            if measured <= due:
+                raise ConflictError(f"request {request_id} is not overdue")
+            detected_at = format_timestamp(measured)
+            alert_id = f"sla-{uuid.uuid4().hex}"
+            self._insert(
+                "INSERT INTO sla_alerts(alert_id, request_id, subject_id, actor, reason,"
+                " due_at, detected_at, overdue_seconds, status,"
+                " acknowledged_at, acknowledged_by, acknowledged_note)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL)",
+                (alert_id, request_id, document["subject_id"],
+                 spec["actor"], spec["reason"], document["sla_due_at"], detected_at,
+                 int((measured - due).total_seconds())),
+                f"an SLA alert already exists for request {request_id} due at {document['sla_due_at']}",
+            )
+            view = self._alert_view(self._load_alert(alert_id))
+            return {field: view[field] for field in (
+                "alert_id", "request_id", "subject_id", "actor", "reason",
+                "due_at", "detected_at", "overdue_seconds", "status")}
+
+        return self._idempotent(key, f"create-sla-alert:{request_id}", create)
+
+    def sla_alerts(self, request_id: str) -> dict[str, Any]:
+        self._load(request_id)
+        rows = self.store.connection.execute(
+            "SELECT * FROM sla_alerts WHERE request_id = ?", (request_id,)
+        ).fetchall()
+        alerts = [self._alert_view(row) for row in rows]
+        alerts.sort(key=lambda alert: (parse_timestamp(alert["detected_at"], "detected_at"), alert["alert_id"]))
+        open_count = sum(1 for alert in alerts if alert["status"] == "open")
+        acknowledged = sum(1 for alert in alerts if alert["status"] == "acknowledged")
+        total = len(alerts)
+        return {
+            "request_id": request_id, "alerts": alerts,
+            "totals": {"total": total, "open": open_count, "acknowledged": acknowledged, "count": total},
+        }
+
+    def acknowledge_sla_alert(self, alert_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Mark an open alert acknowledged; the overdue fact itself never changes."""
+        spec = model.parse_sla_acknowledgement(raw)
+
+        def apply() -> dict[str, Any]:
+            row = self._load_alert(alert_id)
+            if row["status"] == "acknowledged":
+                raise ConflictError(f"SLA alert {alert_id} was already acknowledged")
+            self.store.connection.execute(
+                "UPDATE sla_alerts SET status = 'acknowledged', acknowledged_at = ?,"
+                " acknowledged_by = ?, acknowledged_note = ? WHERE alert_id = ?",
+                (format_timestamp(self._now()), spec["actor"], spec["note"], alert_id),
+            )
+            return self._alert_view(self._load_alert(alert_id))
+
+        return self._idempotent(key, f"acknowledge-sla-alert:{alert_id}", apply)
+
+    def _load_alert(self, alert_id: str) -> Any:
+        row = self.store.connection.execute(
+            "SELECT * FROM sla_alerts WHERE alert_id = ?", (alert_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError(f"SLA alert {alert_id} was not found")
+        return row
+
+    def _alert_view(self, row: Any) -> dict[str, Any]:
+        return {
+            "alert_id": row["alert_id"], "request_id": row["request_id"], "subject_id": row["subject_id"],
+            "actor": row["actor"], "reason": row["reason"],
+            "due_at": row["due_at"], "detected_at": row["detected_at"],
+            "overdue_seconds": row["overdue_seconds"], "status": row["status"],
+            "acknowledged_at": row["acknowledged_at"], "acknowledged_by": row["acknowledged_by"],
+            "acknowledged_note": row["acknowledged_note"],
         }
 
 

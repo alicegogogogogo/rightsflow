@@ -14,6 +14,8 @@ POLICY_FIELDS = ("id", "retention_days", "action")
 TRANSITION_FIELDS = ("action", "actor", "note", "reason", "details")
 TASK_CREATE_FIELDS = ("id", "system", "query", "actor")
 TASK_ACTION_FIELDS = {"start": ("actor",), "complete": ("actor", "records"), "fail": ("actor", "reason")}
+SLA_ALERT_FIELDS = ("actor", "reason")
+SLA_ACKNOWLEDGE_FIELDS = ("actor", "note")
 
 ACTION_TARGETS = {
     "verify_identity": "identity_verified",
@@ -179,6 +181,20 @@ def parse_retrieval_action(action: str, raw: Any) -> dict[str, Any]:
     elif action == "fail":
         parsed["reason"] = text(raw["reason"], "reason", 1000)
     return parsed
+
+
+def parse_sla_alert(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != set(SLA_ALERT_FIELDS):
+        raise ValidationError("SLA alert must contain exactly actor and reason")
+    return {"actor": text(raw["actor"], "actor", 200),
+            "reason": text(raw["reason"], "reason", 1000)}
+
+
+def parse_sla_acknowledgement(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != set(SLA_ACKNOWLEDGE_FIELDS):
+        raise ValidationError("acknowledge must contain exactly actor and note")
+    return {"actor": text(raw["actor"], "actor", 200),
+            "note": text(raw["note"], "note", 2000)}
 
 
 def _task_records(value: Any) -> list[dict[str, Any]]:
