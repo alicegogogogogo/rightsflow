@@ -16,6 +16,10 @@ TASK_CREATE_FIELDS = ("id", "system", "query", "actor")
 TASK_ACTION_FIELDS = {"start": ("actor",), "complete": ("actor", "records"), "fail": ("actor", "reason")}
 SLA_ALERT_FIELDS = ("actor", "reason")
 SLA_ACKNOWLEDGE_FIELDS = ("actor", "note")
+REVIEW_FIELDS = ("review_id", "action", "actor", "reason", "note")
+REVIEW_ACTIONS = ("fulfill", "reject")
+REVIEW_DECISION_FIELDS = ("actor", "decision", "note")
+DECISIONS = ("approve", "deny")
 
 ACTION_TARGETS = {
     "verify_identity": "identity_verified",
@@ -181,6 +185,53 @@ def parse_retrieval_action(action: str, raw: Any) -> dict[str, Any]:
     elif action == "fail":
         parsed["reason"] = text(raw["reason"], "reason", 1000)
     return parsed
+
+
+def parse_review(raw: Any) -> dict[str, Any]:
+    """Validate a dual-review proposal for `reject` or `fulfill`.
+
+    The reason rule mirrors the direct transition: `reject` requires a non-empty
+    reason and `fulfill` forbids one. `note` is optional and may be null.
+    """
+    if not isinstance(raw, dict):
+        raise ValidationError("review must be an object")
+    unknown = sorted(set(raw) - set(REVIEW_FIELDS))
+    if unknown:
+        raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+    for required in ("review_id", "action", "actor"):
+        if required not in raw:
+            raise ValidationError(f"review must contain {required}")
+    action = raw["action"]
+    if action not in REVIEW_ACTIONS:
+        raise ValidationError(f"action must be one of {', '.join(REVIEW_ACTIONS)}")
+
+    reason = raw.get("reason")
+    if action == "reject":
+        if not isinstance(reason, str) or not reason:
+            raise ValidationError("reject requires a non-empty reason")
+        reason = text(reason, "reason", 1000)
+    elif reason is not None:
+        raise ValidationError("reason is only allowed for reject")
+
+    return {"review_id": identifier(raw["review_id"], "review id"), "action": action,
+            "actor": text(raw["actor"], "actor", 200), "reason": reason,
+            "note": text(raw.get("note"), "note", 2000, allow_null=True)}
+
+
+def parse_review_decision(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValidationError("decision must be an object")
+    unknown = sorted(set(raw) - set(REVIEW_DECISION_FIELDS))
+    if unknown:
+        raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+    for required in ("actor", "decision"):
+        if required not in raw:
+            raise ValidationError(f"decision must contain {required}")
+    decision = raw["decision"]
+    if decision not in DECISIONS:
+        raise ValidationError(f"decision must be one of {', '.join(DECISIONS)}")
+    return {"actor": text(raw["actor"], "actor", 200), "decision": decision,
+            "note": text(raw.get("note"), "note", 2000, allow_null=True)}
 
 
 def parse_sla_alert(raw: Any) -> dict[str, Any]:

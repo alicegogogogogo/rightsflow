@@ -130,6 +130,54 @@ class ServerTests(unittest.TestCase):
         self.assertEqual("received", self.call("GET", "/requests/req-1")[1]["state"])
         self.assertEqual(1, self.call("GET", "/requests/req-1/evidence")[1]["count"])
 
+    def test_reviews_over_http(self):
+        self.call("POST", "/policies", {"id": "eu", "retention_days": 30, "action": "delete"}, key="p1")
+        self.call("POST", "/requests", {"id": "req-1", "subject_id": "user-1", "request_type": "access",
+                                        "policy_id": "eu", "sla_days": 30, "actor": "agent"}, key="r1")
+        status, body = self.call("POST", "/requests/req-1/reviews",
+                                 {"review_id": "rev-1", "action": "reject", "actor": "agent"})
+        self.assertEqual((400, "validation_error"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/req-1/reviews",
+                                 {"review_id": "rev-1", "action": "fulfill", "actor": "agent"}, key="v0")
+        self.assertEqual((409, "illegal_transition"), (status, body["error"]["code"]))
+        status, review = self.call("POST", "/requests/req-1/reviews",
+                                   {"review_id": "rev-1", "action": "reject", "actor": "agent",
+                                    "reason": "manifestly unfounded"}, key="v1")
+        self.assertEqual((201, "pending", "received"),
+                         (status, review["status"], review["snapshot_state"]))
+        status, body = self.call("POST", "/requests/req-1/reviews",
+                                 {"review_id": "rev-2", "action": "reject", "actor": "other",
+                                  "reason": "duplicate"}, key="v2")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/req-1/reviews/rev-1/decisions",
+                                 {"actor": "agent", "decision": "approve"}, key="d1")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, body = self.call("POST", "/requests/req-1/reviews/rev-1/decisions",
+                                 {"actor": "reviewer-1", "decision": "maybe"}, key="d2")
+        self.assertEqual((400, "validation_error"), (status, body["error"]["code"]))
+        status, decided = self.call("POST", "/requests/req-1/reviews/rev-1/decisions",
+                                    {"actor": "reviewer-1", "decision": "approve"}, key="d3")
+        self.assertEqual((200, "pending", 1),
+                         (status, decided["status"], len(decided["decisions"])))
+        self.assertEqual("received", self.call("GET", "/requests/req-1")[1]["state"])
+        status, applied = self.call("POST", "/requests/req-1/reviews/rev-1/decisions",
+                                    {"actor": "reviewer-2", "decision": "approve"}, key="d4")
+        self.assertEqual((200, "applied"), (status, applied["status"]))
+        self.assertEqual("rejected", applied["transition_result"]["state"])
+        self.assertEqual("2026-01-01T00:00:00Z", applied["applied_at"])
+        status, body = self.call("POST", "/requests/req-1/reviews/rev-1/decisions",
+                                 {"actor": "reviewer-3", "decision": "approve"}, key="d5")
+        self.assertEqual((409, "conflict"), (status, body["error"]["code"]))
+        status, single = self.call("GET", "/requests/req-1/reviews/rev-1")
+        self.assertEqual((200, "applied", 2),
+                         (status, single["status"], len(single["decisions"])))
+        status, listing = self.call("GET", "/requests/req-1/reviews")
+        self.assertEqual((200, ["rev-1"]), (status, [r["review_id"] for r in listing["reviews"]]))
+        status, body = self.call("GET", "/requests/req-1/reviews/ghost")
+        self.assertEqual((404, "not_found"), (status, body["error"]["code"]))
+        self.assertEqual("rejected", self.call("GET", "/requests/req-1")[1]["state"])
+        self.assertEqual(2, self.call("GET", "/requests/req-1/evidence")[1]["count"])
+
     def test_content_type_and_query_parameters_are_enforced(self):
         status, body = self.call("POST", "/policies", "{}", key="p1", content_type="text/plain")
         self.assertEqual((400, "Content-Type must be application/json"), (status, body["error"]["message"]))

@@ -283,6 +283,54 @@ contain exactly `{"actor","note"}`. Answer `200` with the alert now in
 `overdue_seconds` are unchanged. A missing alert is `404 not_found` and a
 repeat acknowledgement is `409 conflict`.
 
+## Dual reviews
+
+`reject` and `fulfill` can optionally go through a **two-person review**
+instead of a direct transition. A review proposes the action; two independent
+reviewers must approve it before anything changes. The direct
+`POST /requests/{id}/transitions` endpoint is unaffected.
+
+`POST /requests/{id}/reviews` *(key required)* — the body carries
+`review_id`, `action` (`reject` or `fulfill`), `actor`, and optionally
+`reason` and `note`, with the usual text limits. As with the direct
+transition, `reject` requires a non-empty `reason` and `fulfill` forbids one;
+`note` may be null. The action's target must be a legal successor of the
+request's current state (`409 illegal_transition` otherwise), and the review
+snapshots `state` and `evidence_head` at creation. A request keeps at most one
+**pending** review per action (`409 conflict`); a missing request is `404
+not_found`. Answer `201` with the review in `pending`.
+
+`POST /requests/{id}/reviews/{review_id}/decisions` *(key required)* — the
+body carries `actor`, `decision` (`approve` or `deny`), and optionally `note`;
+anything else is `400 validation_error`. The proposing actor cannot decide and
+no actor may decide twice (`409 conflict`). The first independent `approve`
+only records the decision; the **second** `approve` atomically executes the
+proposed transition — one history entry, one evidence entry, the same closure
+reason and retention snapshot a direct transition would produce — and the
+review becomes `applied` with `applied_at` from the injected clock and a
+`transition_result` identical to the direct-transition response. Concurrent
+approvals produce exactly one change. Any `deny` ends the review as `denied`
+without touching the request or the evidence chain. If the request's `state`
+or `evidence_head` has moved away from the snapshot when a decision arrives,
+the review ends as `stale` and that decision is **not** recorded. Deciding a
+`denied`, `applied`, or `stale` review is `409 conflict`; a missing request or
+review is `404 not_found`.
+
+`GET /requests/{id}/reviews/{review_id}` and `GET /requests/{id}/reviews`
+return the full review — status, snapshot, `created_at`/`applied_at`, the
+decisions in submission order, and the execution result. The list is sorted by
+`created_at` then `review_id`.
+
+```json
+{"request_id":"req-1","review_id":"rev-1","action":"reject","actor":"agent-7",
+ "reason":"manifestly unfounded","note":null,"status":"applied",
+ "snapshot_state":"received","snapshot_evidence_head":"f8e5…b7f4",
+ "created_at":"2026-01-01T00:00:00Z","applied_at":"2026-01-01T02:00:00Z",
+ "decisions":[{"actor":"reviewer-1","decision":"approve","note":null,"decided_at":"2026-01-01T01:00:00Z"},
+              {"actor":"reviewer-2","decision":"approve","note":null,"decided_at":"2026-01-01T02:00:00Z"}],
+ "transition_result":{"id":"req-1","state":"rejected",...}}
+```
+
 `GET /requests/{id}` — the materialized request:
 
 ```json

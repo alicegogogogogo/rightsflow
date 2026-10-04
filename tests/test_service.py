@@ -654,6 +654,233 @@ class SlaAlertTests(unittest.TestCase):
             self.service.acknowledge_sla_alert(created["alert_id"], {"actor": "dpo", "note": "n"}, None)
 
 
+class ReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = FixedClock("2026-01-01T00:00:00Z")
+        self.service = RightsFlow(str(Path(self.directory.name) / "test.db"), clock=self.clock)
+        self.service.create_policy({"id": "eu-access", "retention_days": 30, "action": "delete"}, "policy-1")
+        self.service.create_request({"id": "req-1", "subject_id": "user-42", "request_type": "access",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def propose(self, review_id="rev-1", request_id="req-1", key=None, **overrides):
+        body = {"review_id": review_id, "action": "reject", "actor": "agent-7",
+                "reason": "manifestly unfounded", "note": None}
+        body.update(overrides)
+        return self.service.create_review(request_id, body, key or f"review-{review_id}")
+
+    def decide(self, actor, decision, review_id="rev-1", request_id="req-1", key=None, **overrides):
+        body = {"actor": actor, "decision": decision}
+        body.update(overrides)
+        return self.service.decide_review(request_id, review_id, body,
+                                          key or f"decide-{review_id}-{actor}")
+
+    def reach_packaged(self, request_id="req-1"):
+        self.service.transition(request_id, {"action": "verify_identity", "actor": "dpo"}, f"{request_id}-v")
+        self.service.transition(request_id, {"action": "scope", "actor": "dpo"}, f"{request_id}-s")
+        self.service.transition(request_id, {"action": "collect", "actor": "dpo",
+                                             "details": {"records": []}}, f"{request_id}-c")
+        return self.service.transition(request_id, {"action": "package", "actor": "dpo",
+                                                    "details": {"artifact": "bundle-1"}}, f"{request_id}-p")
+
+    def test_create_snapshots_state_and_evidence_head(self):
+        head = self.service.get_request("req-1")["evidence_head"]
+        review = self.propose()
+        self.assertEqual({"request_id": "req-1", "review_id": "rev-1", "action": "reject", "actor": "agent-7",
+                          "reason": "manifestly unfounded", "note": None, "status": "pending",
+                          "snapshot_state": "received", "snapshot_evidence_head": head,
+                          "created_at": "2026-01-01T00:00:00Z", "applied_at": None,
+                          "decisions": [], "transition_result": None}, review)
+        self.assertEqual("received", self.service.get_request("req-1")["state"])
+        self.assertEqual(1, self.service.evidence("req-1")["count"])
+
+    def test_create_validation(self):
+        with self.assertRaisesRegex(ValidationError, "unknown field"):
+            self.propose(extra="nope")
+        with self.assertRaisesRegex(ValidationError, "review must contain review_id"):
+            self.service.create_review(
+                "req-1", {"action": "reject", "actor": "a", "reason": "r"}, "no-id")
+        with self.assertRaisesRegex(ValidationError, "action must be one of fulfill, reject"):
+            self.propose(action="cancel")
+        with self.assertRaisesRegex(ValidationError, "reject requires a non-empty reason"):
+            self.propose(reason=None)
+        with self.assertRaisesRegex(ValidationError, "reject requires a non-empty reason"):
+            self.propose(reason="")
+        with self.assertRaisesRegex(ValidationError, "reason is only allowed for reject"):
+            self.propose(action="fulfill", reason="not allowed")
+        with self.assertRaisesRegex(ValidationError, "note must be a non-empty string of at most 2000"):
+            self.propose(note="x" * 2001)
+        with self.assertRaisesRegex(ValidationError, "review id must be a non-empty string of at most 100"):
+            self.propose(review_id="x" * 101)
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.create_review("req-1", {"review_id": "r", "action": "reject",
+                                                 "actor": "a", "reason": "r"}, None)
+
+    def test_create_requires_legal_successor_and_existing_request(self):
+        with self.assertRaisesRegex(
+                IllegalTransitionError,
+                "illegal transition from received to fulfilled; "
+                "legal successors: cancelled, identity_verified, rejected"):
+            self.propose(action="fulfill", reason=None)
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.propose(request_id="ghost")
+        self.service.transition("req-1", {"action": "cancel", "actor": "subject", "reason": "withdrawn"}, "cancel-1")
+        with self.assertRaisesRegex(IllegalTransitionError, "legal successors: none"):
+            self.propose()
+
+    def test_pending_conflict_and_duplicate_review_id(self):
+        self.propose()
+        with self.assertRaisesRegex(ConflictError, "pending review for action reject"):
+            self.propose("rev-2")
+        with self.assertRaisesRegex(ConflictError, "review rev-1 already exists"):
+            self.propose(key="another-key")
+        # A different action on the same request may pend in parallel.
+        self.reach_packaged()
+        parallel = self.propose("rev-fulfill", action="fulfill", reason=None)
+        self.assertEqual("pending", parallel["status"])
+
+    def test_two_approvals_apply_the_change_exactly_once(self):
+        self.propose()
+        first = self.decide("reviewer-1", "approve", note="looks right")
+        self.assertEqual("pending", first["status"])
+        self.assertEqual([{"actor": "reviewer-1", "decision": "approve", "note": "looks right",
+                           "decided_at": "2026-01-01T00:00:00Z"}], first["decisions"])
+        self.assertEqual("received", self.service.get_request("req-1")["state"])
+        self.assertEqual(1, self.service.evidence("req-1")["count"])
+
+        self.clock.advance(hours=2)
+        applied = self.decide("reviewer-2", "approve")
+        self.assertEqual(("applied", "2026-01-01T02:00:00Z"), (applied["status"], applied["applied_at"]))
+        self.assertEqual(["reviewer-1", "reviewer-2"], [d["actor"] for d in applied["decisions"]])
+
+        request = self.service.get_request("req-1")
+        self.assertEqual(("rejected", "manifestly unfounded", "2026-01-01T02:00:00Z"),
+                         (request["state"], request["closed_reason"], request["closed_at"]))
+        self.assertEqual([None, "reject"], [entry["action"] for entry in request["history"]])
+        self.assertEqual("agent-7", request["history"][-1]["actor"])
+        self.assertEqual({"policy_id": "eu-access", "retention_days": 30, "action": "delete",
+                          "expires_at": "2026-01-31T02:00:00Z", "applied_at": None, "affected_records": 0},
+                         request["retention"])
+        chain = self.service.evidence("req-1")
+        self.assertEqual((2, True), (chain["count"], chain["chain_valid"]))
+        payload = chain["entries"][-1]["content"]["payload"]
+        self.assertEqual({"action": "reject", "from": "received", "to": "rejected", "actor": "agent-7",
+                          "note": None, "reason": "manifestly unfounded", "details": None}, payload)
+        self.assertEqual(request, applied["transition_result"])
+        with self.assertRaisesRegex(ConflictError, "review rev-1 is applied"):
+            self.decide("reviewer-3", "approve")
+
+    def test_applied_result_matches_a_direct_transition(self):
+        self.service.create_request({"id": "req-2", "subject_id": "user-42", "request_type": "access",
+                                     "policy_id": "eu-access", "sla_days": 30, "actor": "agent-7"}, "create-req-2")
+        direct = self.service.transition("req-2", {"action": "reject", "actor": "agent-7",
+                                                   "reason": "manifestly unfounded"}, "req-2-reject")
+        self.propose()
+        self.decide("reviewer-1", "approve")
+        reviewed = self.decide("reviewer-2", "approve")["transition_result"]
+        for field in ("state", "updated_at", "closed_at", "closed_reason", "retention", "sla"):
+            self.assertEqual(direct[field], reviewed[field])
+        self.assertEqual(direct["history"][-1], reviewed["history"][-1])
+
+    def test_proposer_and_repeat_actor_cannot_decide(self):
+        self.propose()
+        with self.assertRaisesRegex(ConflictError, "proposed review rev-1"):
+            self.decide("agent-7", "approve")
+        self.decide("reviewer-1", "approve")
+        with self.assertRaisesRegex(ConflictError, "already decided"):
+            self.decide("reviewer-1", "approve", key="reviewer-1-again")
+        with self.assertRaisesRegex(ConflictError, "already decided"):
+            self.decide("reviewer-1", "deny", key="reviewer-1-deny")
+        self.assertEqual(1, len(self.service.get_review("req-1", "rev-1")["decisions"]))
+
+    def test_deny_terminates_without_touching_the_request(self):
+        self.propose()
+        self.decide("reviewer-1", "approve")
+        denied = self.decide("reviewer-2", "deny", note="not convinced")
+        self.assertEqual("denied", denied["status"])
+        self.assertEqual(["approve", "deny"], [d["decision"] for d in denied["decisions"]])
+        request = self.service.get_request("req-1")
+        self.assertEqual(("received", None, None),
+                         (request["state"], request["closed_at"], request["closed_reason"]))
+        self.assertEqual(1, self.service.evidence("req-1")["count"])
+        with self.assertRaisesRegex(ConflictError, "review rev-1 is denied"):
+            self.decide("reviewer-3", "approve")
+
+    def test_stale_when_the_request_moves_before_a_decision(self):
+        self.propose()
+        self.service.transition("req-1", {"action": "verify_identity", "actor": "dpo"}, "req-1-v")
+        stale = self.decide("reviewer-1", "approve")
+        self.assertEqual(("stale", [], None),
+                         (stale["status"], stale["decisions"], stale["applied_at"]))
+        self.assertEqual("identity_verified", self.service.get_request("req-1")["state"])
+        self.assertEqual(2, self.service.evidence("req-1")["count"])
+        with self.assertRaisesRegex(ConflictError, "review rev-1 is stale"):
+            self.decide("reviewer-2", "approve")
+
+    def test_decision_validation(self):
+        self.propose()
+        with self.assertRaisesRegex(ValidationError, "unknown field"):
+            self.decide("reviewer-1", "approve", reason="nope")
+        with self.assertRaisesRegex(ValidationError, "decision must contain decision"):
+            self.service.decide_review("req-1", "rev-1", {"actor": "a"}, "missing-decision")
+        with self.assertRaisesRegex(ValidationError, "decision must be one of approve, deny"):
+            self.decide("reviewer-1", "maybe")
+        with self.assertRaisesRegex(ValidationError, "note must be a non-empty string of at most 2000"):
+            self.decide("reviewer-1", "approve", note="x" * 2001)
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.decide_review("req-1", "rev-1", {"actor": "a", "decision": "approve"}, None)
+        with self.assertRaisesRegex(NotFoundError, "review ghost was not found"):
+            self.decide("reviewer-1", "approve", review_id="ghost")
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.decide("reviewer-1", "approve", request_id="ghost")
+
+    def test_idempotency_replay_and_cross_operation_conflict(self):
+        created = self.propose()
+        self.assertEqual(created, self.propose(key="review-rev-1", reason="different body, same key"))
+        with self.assertRaises(ConflictError):
+            self.propose("rev-2", key="review-rev-1")
+        first = self.decide("reviewer-1", "approve")
+        self.assertEqual(first, self.decide("reviewer-1", "approve"))
+        self.assertEqual(1, len(self.service.get_review("req-1", "rev-1")["decisions"]))
+        with self.assertRaises(ConflictError):
+            self.decide("reviewer-2", "approve", key="decide-rev-1-reviewer-1")
+
+    def test_fulfill_review_closes_like_a_direct_fulfill(self):
+        self.reach_packaged()
+        review = self.propose("rev-f", action="fulfill", reason=None, note="ship it")
+        self.assertEqual(("fulfill", None, "packaged"),
+                         (review["action"], review["reason"], review["snapshot_state"]))
+        self.decide("reviewer-1", "approve", review_id="rev-f")
+        applied = self.decide("reviewer-2", "approve", review_id="rev-f")
+        self.assertEqual("applied", applied["status"])
+        request = self.service.get_request("req-1")
+        self.assertEqual(("fulfilled", None), (request["state"], request["closed_reason"]))
+        self.assertEqual("ship it", request["history"][-1]["note"])
+        self.assertEqual(6, self.service.evidence("req-1")["count"])
+
+    def test_get_and_list_reviews(self):
+        with self.assertRaisesRegex(NotFoundError, "request ghost was not found"):
+            self.service.reviews("ghost")
+        with self.assertRaisesRegex(NotFoundError, "review ghost was not found"):
+            self.service.get_review("req-1", "ghost")
+        self.assertEqual({"request_id": "req-1", "reviews": []}, self.service.reviews("req-1"))
+        self.propose("rev-b")
+        self.decide("reviewer-1", "deny", review_id="rev-b")
+        self.propose("rev-a")  # rev-b is denied, so a new reject review may pend
+        self.clock.advance(hours=1)
+        self.reach_packaged()
+        self.propose("rev-c", action="fulfill", reason=None)
+        listing = self.service.reviews("req-1")
+        self.assertEqual(["rev-a", "rev-b", "rev-c"], [r["review_id"] for r in listing["reviews"]])
+        self.assertEqual(["pending", "denied", "pending"], [r["status"] for r in listing["reviews"]])
+        single = self.service.get_review("req-1", "rev-b")
+        self.assertEqual("denied", single["status"])
+        self.assertEqual([d["actor"] for d in single["decisions"]], ["reviewer-1"])
+
+
 class AuditExportTests(unittest.TestCase):
     def service(self, moment="2026-01-01T00:00:00Z"):
         directory = tempfile.TemporaryDirectory()
