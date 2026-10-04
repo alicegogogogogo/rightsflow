@@ -62,6 +62,68 @@ From a closed request the successor list is the literal string `none`, e.g.
 `reason` is **required** for `reject`/`cancel` and **forbidden** elsewhere; `details` is
 required for `collect`/`package` and is otherwise absent or `{}`, else `400 validation_error`.
 
+## Dual-person review (optional)
+
+`reject` and `fulfill` may optionally be gated behind two independent reviewers. A
+review **proposes** one of those actions and records reviewer decisions; it never
+changes the request itself until a second independent approval applies the change.
+Opening or deciding a review does not alter the direct
+`POST /requests/{id}/transitions` behavior in any way.
+
+`POST /requests/{id}/reviews` *(key required)* — the body must contain exactly
+`{"review_id","action","actor","reason","note"}`, where `action` is `reject` or
+`fulfill`. The `reason`/`note` rules mirror the direct transition: `reject`
+requires a non-empty `reason` (≤1000), `fulfill` **forbids** `reason`, and `note`
+is `null` or a string of at most 2000; `actor` is ≤200. The proposed action must
+be a legal successor of the request's current state, else `409
+illegal_transition` (nothing is created). On creation the current `state` and
+`evidence_head` are snapshotted. A second pending review for the same request and
+action is `409 conflict`; a reused `review_id` is `409 conflict`; a missing
+request is `404 not_found`. Answer `201`:
+
+```json
+{"request_id":"req-1","review_id":"rev-1","action":"reject","actor":"proposer","reason":"unfounded","note":null,
+ "status":"pending","state_snapshot":"received","evidence_head_snapshot":"f8e51c51…14b7f4",
+ "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","applied_at":null,
+ "decisions":[],"transition_result":null}
+```
+
+`POST /requests/{id}/reviews/{review_id}/decisions` *(key required)* — the body
+must contain exactly `{"actor","decision","note"}`; `decision` is `approve` or
+`deny` (any other value, a non-string, or an extra field is `400
+validation_error`), `note` is `null` or ≤2000. A decision on a missing request or
+review is `404 not_found`. The lifecycle:
+
+- The **proposing actor may not decide**; the same actor may not decide twice.
+  Either is `409 conflict` and records nothing.
+- The **first independent approval only records the decision** — the review stays
+  `pending`, and the request and evidence chain are untouched.
+- The **second approval atomically applies** the proposed state change. The
+  review becomes `applied`, `applied_at` is the injected clock, and the change is
+  byte-for-byte the same one a direct transition makes: one `history` entry, one
+  `transition` evidence entry (with the proposal's `actor`/`note`/`reason`), the
+  same `closed_reason` and retention snapshot. `transition_result` carries the
+  full materialized request that a direct transition would return. Concurrent
+  second approvals are serialized so that exactly one change, one history entry,
+  and one evidence entry result; the losing approval is `409 conflict` and is not
+  recorded.
+- **Any deny** terminates the review as `denied`: the decision is recorded, but no
+  request state, evidence, or retention data changes.
+- If a decision arrives after the request has moved away from the snapshot
+  (`state` **or** `evidence_head` differs), the review terminates as `stale` and
+  that decision is **not recorded** — this rule is unconditional and fires even
+  for the proposer.
+- A further decision on a `denied`, `applied`, or `stale` review is `409 conflict`.
+
+Decisions are returned in commit order. `GET /requests/{id}/reviews/{review_id}`
+returns the single review (full decisions and `transition_result`); a missing
+request or review is `404 not_found`. `GET /requests/{id}/reviews` returns
+`{"request_id","reviews":[...]}` sorted by `created_at` then `review_id`.
+
+Both POSTs require an `Idempotency-Key`: a repeated key replays the stored
+response verbatim (a replayed second approval does not apply twice), and reusing
+a key for a different operation is `409 conflict`.
+
 ## Evidence chain
 
 Entry 1 is written when the request is created (`type` `request_received`); every

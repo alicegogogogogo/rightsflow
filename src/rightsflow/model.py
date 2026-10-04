@@ -16,6 +16,10 @@ TASK_CREATE_FIELDS = ("id", "system", "query", "actor")
 TASK_ACTION_FIELDS = {"start": ("actor",), "complete": ("actor", "records"), "fail": ("actor", "reason")}
 SLA_ALERT_FIELDS = ("actor", "reason")
 SLA_ACKNOWLEDGE_FIELDS = ("actor", "note")
+REVIEW_FIELDS = ("review_id", "action", "actor", "reason", "note")
+REVIEW_DECISION_FIELDS = ("actor", "decision", "note")
+REVIEW_ACTIONS = ("reject", "fulfill")
+REVIEW_DECISIONS = ("approve", "deny")
 
 ACTION_TARGETS = {
     "verify_identity": "identity_verified",
@@ -195,6 +199,41 @@ def parse_sla_acknowledgement(raw: Any) -> dict[str, Any]:
         raise ValidationError("acknowledge must contain exactly actor and note")
     return {"actor": text(raw["actor"], "actor", 200),
             "note": text(raw["note"], "note", 2000)}
+
+
+def parse_review(raw: Any) -> dict[str, Any]:
+    """Validate a dual-review proposal for `reject` or `fulfill`.
+
+    `reject` carries the same non-empty `reason` as a direct reject transition;
+    `fulfill` forbids `reason` just as a direct fulfill does.
+    """
+    if not isinstance(raw, dict) or set(raw) != set(REVIEW_FIELDS):
+        raise ValidationError(
+            "review must contain exactly review_id, action, actor, reason, and note")
+    action = raw["action"]
+    if action not in REVIEW_ACTIONS:
+        raise ValidationError(f"action must be one of {', '.join(REVIEW_ACTIONS)}")
+    reason = raw["reason"]
+    if action == "reject":
+        if not isinstance(reason, str) or not reason:
+            raise ValidationError("reject requires a non-empty reason")
+        reason = text(reason, "reason", 1000)
+    elif reason is not None:
+        raise ValidationError("reason is only allowed for reject")
+    return {"review_id": identifier(raw["review_id"], "review id"),
+            "action": action, "actor": text(raw["actor"], "actor", 200),
+            "reason": reason,
+            "note": text(raw.get("note"), "note", 2000, allow_null=True)}
+
+
+def parse_review_decision(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != set(REVIEW_DECISION_FIELDS):
+        raise ValidationError("decision must contain exactly actor, decision, and note")
+    decision = raw["decision"]
+    if decision not in REVIEW_DECISIONS:
+        raise ValidationError(f"decision must be one of {', '.join(REVIEW_DECISIONS)}")
+    return {"actor": text(raw["actor"], "actor", 200), "decision": decision,
+            "note": text(raw.get("note"), "note", 2000, allow_null=True)}
 
 
 def _task_records(value: Any) -> list[dict[str, Any]]:

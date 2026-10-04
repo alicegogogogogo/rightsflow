@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterator
@@ -19,6 +20,10 @@ class RightsFlow:
     def __init__(self, database: str, clock: Clock | None = None):
         self.store = Store(database)
         self.clock = clock if clock is not None else SystemClock()
+        # SQLite serializes writers, but two concurrent transactions can both read
+        # a pre-change snapshot; the lock makes a compound write (e.g. the second
+        # review approval plus its state change) observe its own commit ordering.
+        self._write_lock = threading.RLock()
 
     # ------------------------------------------------------------------ internals
 
@@ -28,7 +33,7 @@ class RightsFlow:
     def _idempotent(self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         if not key:
             raise ValidationError("Idempotency-Key header is required")
-        with self.store.transaction() as connection:
+        with self._write_lock, self.store.transaction() as connection:
             row = connection.execute("SELECT operation, response FROM idempotency WHERE key = ?", (key,)).fetchone()
             if row:
                 if row["operation"] != operation:
@@ -182,42 +187,56 @@ class RightsFlow:
                 legal = ", ".join(model.successors(source)) or "none"
                 raise IllegalTransitionError(f"illegal transition from {source} to {target}; legal successors: {legal}")
             occurred_at = format_timestamp(self._now())
-
-            if change["action"] == "collect":
-                for record in change["records"]:
-                    self.store.connection.execute(
-                        "INSERT INTO records(request_id, record_id, subject_id, payload, anonymized)"
-                        " VALUES (?, ?, ?, ?, 0)",
-                        (request_id, record["id"], document["subject_id"], self.store.encode(record["payload"])),
-                    )
-                document["collection"] = change["details"]
-
-            document["history"].append(_history_entry(
-                len(document["history"]) + 1, change["action"], source, target, change["actor"],
-                change["note"], change["reason"], change["details"], occurred_at))
-            document["state"] = target
-            document["updated_at"] = occurred_at
-            if target in TERMINAL:
-                policy = self._policy(document["policy_id"])
-                expires = parse_timestamp(occurred_at, "occurred_at") + timedelta(days=policy["retention_days"])
-                document["closed_at"] = occurred_at
-                document["closed_reason"] = change["reason"]
-                document["retention"] = {
-                    "policy_id": policy["id"], "retention_days": policy["retention_days"],
-                    "action": policy["action"], "expires_at": format_timestamp(expires),
-                    "applied_at": None, "affected_records": 0,
-                }
-            self.store.connection.execute(
-                "UPDATE requests SET document = ?, state = ? WHERE id = ?",
-                (self.store.encode(document), document["state"], request_id),
-            )
-            entry = self._append_evidence(request_id, "transition", occurred_at, {
-                "action": change["action"], "from": source, "to": target, "actor": change["actor"],
-                "note": change["note"], "reason": change["reason"], "details": change["details"],
-            })
-            return self._project(document, entry["hash"])
+            projected, _ = self._commit_transition(request_id, document, change, source, target, occurred_at)
+            return projected
 
         return self._idempotent(key, f"transition:{request_id}:{change['action']}", apply)
+
+    def _commit_transition(
+        self, request_id: str, document: dict[str, Any], change: dict[str, Any],
+        source: str, target: str, occurred_at: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Apply one legal state change to a loaded request and append its evidence.
+
+        Shared by direct transitions and by the second approving review decision so
+        that a reviewed change is byte-for-byte identical to a direct one: the same
+        history entry shape, the same closing/retention snapshot, the same evidence
+        payload, and therefore the same hash. Returns the projected request and the
+        appended evidence entry.
+        """
+        if change["action"] == "collect":
+            for record in change["records"]:
+                self.store.connection.execute(
+                    "INSERT INTO records(request_id, record_id, subject_id, payload, anonymized)"
+                    " VALUES (?, ?, ?, ?, 0)",
+                    (request_id, record["id"], document["subject_id"], self.store.encode(record["payload"])),
+                )
+            document["collection"] = change["details"]
+
+        document["history"].append(_history_entry(
+            len(document["history"]) + 1, change["action"], source, target, change["actor"],
+            change["note"], change["reason"], change["details"], occurred_at))
+        document["state"] = target
+        document["updated_at"] = occurred_at
+        if target in TERMINAL:
+            policy = self._policy(document["policy_id"])
+            expires = parse_timestamp(occurred_at, "occurred_at") + timedelta(days=policy["retention_days"])
+            document["closed_at"] = occurred_at
+            document["closed_reason"] = change["reason"]
+            document["retention"] = {
+                "policy_id": policy["id"], "retention_days": policy["retention_days"],
+                "action": policy["action"], "expires_at": format_timestamp(expires),
+                "applied_at": None, "affected_records": 0,
+            }
+        self.store.connection.execute(
+            "UPDATE requests SET document = ?, state = ? WHERE id = ?",
+            (self.store.encode(document), document["state"], request_id),
+        )
+        entry = self._append_evidence(request_id, "transition", occurred_at, {
+            "action": change["action"], "from": source, "to": target, "actor": change["actor"],
+            "note": change["note"], "reason": change["reason"], "details": change["details"],
+        })
+        return self._project(document, entry["hash"]), entry
 
     # ------------------------------------------------------------------- evidence
 
@@ -562,6 +581,201 @@ class RightsFlow:
             "overdue_seconds": row["overdue_seconds"], "status": row["status"],
             "acknowledged_at": row["acknowledged_at"], "acknowledged_by": row["acknowledged_by"],
             "acknowledged_note": row["acknowledged_note"],
+        }
+
+    # -------------------------------------------------------------------- reviews
+
+    def create_review(self, request_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Open an optional dual-person review of a `reject` or `fulfill` change.
+
+        The proposed action must be a legal successor of the request's current
+        state; that state and the evidence head are snapshotted so a later decision
+        can detect that the request has since moved. Nothing here changes the
+        request or appends evidence.
+        """
+        spec = model.parse_review(raw)
+        action = spec["action"]
+        target = model.ACTION_TARGETS[action]
+
+        def create() -> dict[str, Any]:
+            document, head_hash = self._load(request_id)
+            source = document["state"]
+            if target not in model.TRANSITIONS.get(source, ()):
+                legal = ", ".join(model.successors(source)) or "none"
+                raise IllegalTransitionError(
+                    f"illegal transition from {source} to {target}; legal successors: {legal}")
+            existing = self.store.connection.execute(
+                "SELECT review_id FROM reviews WHERE request_id = ? AND action = ? AND status = 'pending'",
+                (request_id, action),
+            ).fetchone()
+            if existing:
+                raise ConflictError(
+                    f"a pending review {existing['review_id']} for action {action} already exists")
+            now = format_timestamp(self._now())
+            self._insert(
+                "INSERT INTO reviews(request_id, review_id, action, actor, reason, note, status,"
+                " state_snapshot, evidence_head_snapshot, created_at, updated_at, applied_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL)",
+                (request_id, spec["review_id"], action, spec["actor"], spec["reason"], spec["note"],
+                 source, head_hash, now, now),
+                f"review {spec['review_id']} already exists",
+            )
+            return self.get_review(request_id, spec["review_id"])
+
+        return self._idempotent(key, f"create-review:{request_id}:{spec['review_id']}", create)
+
+    def review_decision(
+        self, request_id: str, review_id: str, raw: Any, key: str | None
+    ) -> dict[str, Any]:
+        """Record one reviewer decision; the second approval applies the change.
+
+        The first independent approval is only recorded. The second approval
+        atomically performs the proposed state change exactly like a direct
+        transition (one history entry, one evidence entry, the same closing and
+        retention snapshot). Any deny terminates the review as `denied` without
+        touching the request. A decision arriving after the request has moved away
+        from the snapshot terminates the review as `stale` and is not recorded.
+        """
+        spec = model.parse_review_decision(raw)
+
+        def decide() -> dict[str, Any]:
+            review = self._load_review_row(request_id, review_id)
+            document, head_hash = self._load(request_id)
+            if review["status"] != "pending":
+                raise ConflictError(f"review {review_id} is {review['status']}")
+            decided_at = format_timestamp(self._now())
+
+            # The stale rule is unconditional: once the request has moved away from
+            # the snapshot, any arriving decision terminates the review as `stale`
+            # and is not recorded, regardless of who sent it.
+            if (document["state"] != review["state_snapshot"]
+                    or head_hash != review["evidence_head_snapshot"]):
+                self._finish_review(request_id, review_id, "stale", None, decided_at)
+                return self.get_review(request_id, review_id)
+
+            if spec["actor"] == review["actor"]:
+                raise ConflictError("the proposing actor may not review their own proposal")
+
+            prior = self.store.connection.execute(
+                "SELECT decision FROM review_decisions"
+                " WHERE request_id = ? AND review_id = ? AND actor = ?",
+                (request_id, review_id, spec["actor"]),
+            ).fetchone()
+            if prior:
+                raise ConflictError(f"actor {spec['actor']} has already decided on review {review_id}")
+
+            if spec["decision"] == "deny":
+                self._insert_decision(request_id, review_id, spec, decided_at)
+                self._finish_review(request_id, review_id, "denied", None, decided_at)
+                return self.get_review(request_id, review_id)
+
+            # approve
+            approvals = self.store.connection.execute(
+                "SELECT COUNT(*) AS total FROM review_decisions"
+                " WHERE request_id = ? AND review_id = ? AND decision = 'approve'",
+                (request_id, review_id),
+            ).fetchone()["total"]
+            self._insert_decision(request_id, review_id, spec, decided_at)
+            if approvals == 0:
+                # First independent approval: record the decision and nothing else.
+                self.store.connection.execute(
+                    "UPDATE reviews SET updated_at = ? WHERE request_id = ? AND review_id = ?",
+                    (decided_at, request_id, review_id))
+                return self.get_review(request_id, review_id)
+
+            # Second approval: apply the proposed change exactly once.
+            self._finish_review(request_id, review_id, "applied", decided_at, decided_at)
+            change = {"action": review["action"], "actor": review["actor"],
+                      "note": review["note"], "reason": review["reason"],
+                      "details": None, "records": []}
+            projected, _ = self._commit_transition(
+                request_id, document, change, review["state_snapshot"],
+                model.ACTION_TARGETS[review["action"]], decided_at)
+            result = self._transition_result(projected)
+            self.store.connection.execute(
+                "UPDATE reviews SET transition_result = ? WHERE request_id = ? AND review_id = ?",
+                (self.store.encode(result), request_id, review_id))
+            return self.get_review(request_id, review_id)
+
+        return self._idempotent(key, f"review-decision:{request_id}:{review_id}", decide)
+
+    def _insert_decision(self, request_id: str, review_id: str, spec: dict[str, Any], decided_at: str) -> None:
+        seq_row = self.store.connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM review_decisions"
+            " WHERE request_id = ? AND review_id = ?",
+            (request_id, review_id),
+        ).fetchone()
+        self.store.connection.execute(
+            "INSERT INTO review_decisions(request_id, review_id, seq, actor, decision, note, decided_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (request_id, review_id, seq_row["next_seq"], spec["actor"], spec["decision"],
+             spec["note"], decided_at),
+        )
+
+    def _finish_review(
+        self, request_id: str, review_id: str, status: str, applied_at: str | None, updated_at: str
+    ) -> None:
+        self.store.connection.execute(
+            "UPDATE reviews SET status = ?, applied_at = ?, updated_at = ?"
+            " WHERE request_id = ? AND review_id = ?",
+            (status, applied_at, updated_at, request_id, review_id),
+        )
+
+    def _transition_result(self, projected: dict[str, Any]) -> dict[str, Any]:
+        """The applied-change summary, matching a direct transition response.
+
+        Direct transitions return the full projected request; the review carries
+        that same materialized request under `transition_result`, so callers see
+        identical state, closed_reason, and retention snapshots.
+        """
+        return projected
+
+    def get_review(self, request_id: str, review_id: str) -> dict[str, Any]:
+        self._load(request_id)
+        review = self._load_review_row(request_id, review_id)
+        return self._review_view(review)
+
+    def list_reviews(self, request_id: str) -> dict[str, Any]:
+        self._load(request_id)
+        rows = self.store.connection.execute(
+            "SELECT * FROM reviews WHERE request_id = ? ORDER BY created_at, review_id",
+            (request_id,),
+        ).fetchall()
+        return {"request_id": request_id, "reviews": [self._review_view(row) for row in rows]}
+
+    def _load_review_row(self, request_id: str, review_id: str) -> Any:
+        self._load(request_id)
+        row = self.store.connection.execute(
+            "SELECT * FROM reviews WHERE request_id = ? AND review_id = ?",
+            (request_id, review_id),
+        ).fetchone()
+        if not row:
+            raise NotFoundError(f"review {review_id} was not found")
+        return row
+
+    def _review_view(self, row: Any) -> dict[str, Any]:
+        decision_rows = self.store.connection.execute(
+            "SELECT actor, decision, note, decided_at FROM review_decisions"
+            " WHERE request_id = ? AND review_id = ? ORDER BY seq",
+            (row["request_id"], row["review_id"]),
+        ).fetchall()
+        decisions = [{"actor": decision["actor"], "decision": decision["decision"],
+                      "note": decision["note"], "decided_at": decision["decided_at"]}
+                     for decision in decision_rows]
+        keys = row.keys()
+        transition_result = (self.store.decode(row["transition_result"])
+                             if "transition_result" in keys and row["transition_result"] is not None else None)
+        return {
+            "request_id": row["request_id"], "review_id": row["review_id"],
+            "action": row["action"], "actor": row["actor"],
+            "reason": row["reason"], "note": row["note"],
+            "status": row["status"],
+            "state_snapshot": row["state_snapshot"],
+            "evidence_head_snapshot": row["evidence_head_snapshot"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "applied_at": row["applied_at"],
+            "decisions": decisions,
+            "transition_result": transition_result,
         }
 
 

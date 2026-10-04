@@ -40,6 +40,25 @@ CREATE TABLE IF NOT EXISTS sla_alerts (
   acknowledged_at TEXT, acknowledged_by TEXT, acknowledged_note TEXT,
   UNIQUE (request_id, due_at)
 );
+CREATE TABLE IF NOT EXISTS reviews (
+  request_id TEXT NOT NULL REFERENCES requests(id),
+  review_id TEXT NOT NULL,
+  action TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, note TEXT,
+  status TEXT NOT NULL,
+  state_snapshot TEXT NOT NULL, evidence_head_snapshot TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, applied_at TEXT,
+  transition_result TEXT,
+  PRIMARY KEY (request_id, review_id)
+);
+CREATE TABLE IF NOT EXISTS review_decisions (
+  request_id TEXT NOT NULL,
+  review_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  actor TEXT NOT NULL, decision TEXT NOT NULL, note TEXT,
+  decided_at TEXT NOT NULL,
+  PRIMARY KEY (request_id, review_id, seq),
+  UNIQUE (request_id, review_id, actor)
+);
 CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, operation TEXT NOT NULL, response TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS records_by_subject ON records(subject_id);
 """
